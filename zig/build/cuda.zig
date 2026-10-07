@@ -72,7 +72,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -84,7 +84,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
+    const flashnext = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_launch.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    flashnext.addImport("cuda", cuda);
+    flashnext.addImport("core", core);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -125,6 +128,17 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+    // not installed: one embedding row through the captured _embed cubin
+    const embed_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_embed_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    embed_check.addImport("cuda", cuda);
+    embed_check.addImport("core", mods.core);
+    embed_check.addImport("flashnext", mods.flashnext);
+    const embed_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-embed", .root_module = embed_check }));
+    const embed_model = b.option([]const u8, "flashnext_model", "Flash Next checkpoint directory for the embedding check");
+    const embed_kernels = b.option([]const u8, "flashnext_kernels", "captured Triton pack for the embedding check");
+    const embed_token = b.option([]const u8, "flashnext_token", "token id for the embedding check") orelse "7";
+    if (embed_model != null and embed_kernels != null) embed_run.addArgs(&.{ embed_model.?, embed_kernels.?, embed_token });
+    b.step("flashnext-embed", "Upload the Flash Next embedding table and run _embed for one token").dependOn(&embed_run.step);
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
 }
 
@@ -190,7 +204,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     step.dependOn(&server_test.step);
     b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
