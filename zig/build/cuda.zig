@@ -74,23 +74,26 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, living: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const heat = b.createModule(.{ .root_source_file = b.path("zig/src/core/heat.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    // Living Weights' family-neutral learner: a family's lessons, and the server's view of them, import it
+    const living = b.createModule(.{ .root_source_file = b.path("zig/src/living/living.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const nemotron = b.createModule(.{ .root_source_file = b.path("zig/src/families/nemotron/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     nemotron.addImport("cuda", cuda);
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
+    nemotron.addImport("living", living);
     const flashnext = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_launch.zig"), .target = target, .optimize = optimize, .link_libc = true });
     flashnext.addImport("cuda", cuda);
     flashnext.addImport("core", core);
     flashnext.addImport("lanes", lanes);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer, .heat = heat };
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer, .heat = heat, .living = living };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -151,7 +154,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const prompt_count = b.option([]const u8, "flashnext_count", "greedy tokens to emit") orelse "8";
     if (embed_model != null and embed_kernels != null and prompt_ids != null) prompt_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.?, prompt_count });
     b.step("flashnext-prompt", "Run one Flash Next prompt on the captured CUDA kernels").dependOn(&prompt_run.step);
-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, build_options, true).root_module.strip = strip;
+    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, mods.living, build_options, true).root_module.strip = strip;
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
@@ -173,7 +176,7 @@ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module, living: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
     const m = engines(b, target, optimize, cuda, lanes, nemotron, flashnext);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
@@ -182,7 +185,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines) } },
+        .imports = &.{ .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "living", .module = living }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines) } },
     }) });
     exe.root_module.addOptions("build_options", build_options);
     if (!install_native) {
@@ -211,12 +214,21 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .target = host,
         .optimize = .debug,
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } },
+        .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template }, .{ .name = "living", .module = mods.living } },
     });
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     step.dependOn(&server_test.step);
     b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, mods.heat, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // Living Weights: the family-neutral learner, then the pocket in each family's shards over the core's shard files
+    const living_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.living }));
+    const shards = b.createModule(.{ .root_source_file = b.path("zig/src/living_shards_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "living", .module = mods.living }} });
+    const shards_run = b.addRunArtifact(b.addTest(.{ .root_module = shards }));
+    step.dependOn(&living_run.step);
+    step.dependOn(&shards_run.step);
+    const living_step = b.step("test-living", "Living Weights' learner and the pocket in each family's shards, on the host");
+    living_step.dependOn(&living_run.step);
+    living_step.dependOn(&shards_run.step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
@@ -252,7 +264,7 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
     const mods = family(b, target, .fast, cuda, draft_ids);
-    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, build_options, false);
+    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, mods.living, build_options, false);
 }
 
 /// SASS targets every release fatbin holds: Ampere (sm_86), RTX 50 and RTX PRO Blackwell (sm_120), GB10 (sm_121).

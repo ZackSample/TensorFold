@@ -38,7 +38,6 @@ test {
     _ = glue_ref;
     _ = glue_math;
     _ = @import("cuda_prompt_grid.zig");
-    _ = @import("learner.zig");
-    _ = @import("subspace.zig");
+    _ = slide;
     _ = @import("cuda_train_back.zig");
 }
