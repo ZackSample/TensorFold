@@ -1,4 +1,6 @@
-//! One prompt, drafts off: each token is one fused decode row, layers in order, then the argmax.
+//! One prompt, drafts off: the batched pass (cuda_batch.zig) runs the prompt's rows through each layer at once, on
+//! the decode kernels at M rows, so its logits and caches are those of feeding one fused decode row at a time (the
+//! row-by-row path below, kept for checks: TF_FLASHNEXT_PROMPT=rows). Then the argmax.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -9,6 +11,7 @@ const ple = @import("cuda_ple.zig");
 const weights = @import("cuda_prompt_wt.zig");
 const step = @import("cuda_prompt_step.zig");
 const load = @import("cuda_prompt_load.zig");
+pub const batch = @import("cuda_batch.zig");
 
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
@@ -179,7 +182,7 @@ fn head(comptime Tri: type, p: *Pass, tri: Tri, row: usize) !void {
     try p.s.logits.download(0, p.logits);
 }
 
-fn forward(comptime Tri: type, p: *Pass, tri: Tri, layers: []Layer, ids: []const u32, pos0: usize) !void {
+fn forwardRows(comptime Tri: type, p: *Pass, tri: Tri, layers: []Layer, ids: []const u32, pos0: usize) !void {
     @memset(p.mode, 0);
     for (ids, 0..) |token, t| try embedRow(Tri, p, tri, token, p.s.h.ptr + @as(u64, t) * wide * 2);
     for (layers, 0..) |*lw, layer| try runLayer(Tri, p, tri, lw, layer, ids, pos0);
@@ -219,6 +222,14 @@ pub const Engine = struct {
     down_fn: cuda.Function,
     layers: [layers_n]Layer,
     n_layers: usize,
+    /// The batched pass's kernels and scratch (grown to the widest chunk run), and whether prompts run row by row.
+    batch_k: batch.Kernels,
+    /// The n-gram table, open for the engine's life (the batched pass gathers its rows from it).
+    ngram: ple.Ngram,
+    batch_s: ?batch.Scratch = null,
+    rowwise: bool,
+    /// Rows a batched chunk takes at most (TF_FLASHNEXT_CHUNK; the dense cache's nch x 512 by default).
+    chunk: usize,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -270,10 +281,21 @@ pub const Engine = struct {
         }
         e.store.release();
         e.store.closeFile();
+        e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
+        errdefer e.ngram.deinit();
+        e.batch_k = try batch.Kernels.load(driver);
+        e.batch_s = null;
+        e.rowwise = if (std.c.getenv("TF_FLASHNEXT_PROMPT")) |v| std.mem.eql(u8, std.mem.span(v), "rows") else false;
+        e.chunk = batch.default_chunk;
+        if (std.c.getenv("TF_FLASHNEXT_CHUNK")) |v| e.chunk = std.fmt.parseInt(usize, std.mem.span(v), 10) catch batch.default_chunk;
+        if (e.chunk == 0) e.chunk = batch.default_chunk;
         return e;
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.batch_s) |*bs| bs.free(e.gpa);
+        e.batch_k.deinit();
+        e.ngram.deinit();
         e.experts.unload();
         for (e.layers[0..e.n_layers]) |*l| l.free(e.gpa);
         e.head_q.free();
@@ -333,6 +355,55 @@ pub const Engine = struct {
 
     /// Run `ids` on from `seq.fed` and leave the next token's scores in `seq.logits`.
     pub fn predict(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32) !void {
+        if (e.rowwise) return e.predictRows(Tri, tri, seq, ids);
+        return e.forward(Tri, tri, seq, ids, .{});
+    }
+
+    /// Scratch for chunks of `rows` rows, reallocated only to grow.
+    fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
+        if (e.batch_s) |*bs| {
+            if (bs.cap >= rows) return bs;
+            try e.stream.synchronize();
+            bs.free(e.gpa);
+            e.batch_s = null;
+        }
+        e.batch_s = try batch.Scratch.alloc(e.gpa, e.driver, rows);
+        return &e.batch_s.?;
+    }
+
+    /// The batched pass over `ids` from `seq.fed`, in chunks of at most `chunk` rows; the last chunk's head per
+    /// `hooks.logits` (its last row lands in `seq.logits`). A training caller's hooks (keep, nudge, taps, every
+    /// row's logits) describe one chunk: pass at most `chunk` rows with them.
+    pub fn forward(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32, hooks: batch.Hooks) !void {
+        if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
+        const training = hooks.keep != null or hooks.nudge != null or hooks.taps != null or hooks.logits == .all;
+        if (training and ids.len > e.chunk) return error.UnexpectedTensor;
+        const s = try e.batchScratch(@min(ids.len, e.chunk));
+        var p: batch.Pass(Tri) = .{
+            .gpa = e.gpa,
+            .io = e.io,
+            .stream = e.stream.*,
+            .tri = tri,
+            .k = &e.batch_k,
+            .s = s,
+            .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
+            .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .history = &seq.history },
+            .hooks = hooks,
+        };
+        var at: usize = 0;
+        while (at < ids.len) {
+            const n = @min(s.cap, ids.len - at);
+            const last = at + n == ids.len;
+            p.hooks.logits = if (last) hooks.logits else .none;
+            try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none) seq.logits else null);
+            at += n;
+        }
+        if (hooks.logits == .none) try e.stream.synchronize();
+        seq.fed += ids.len;
+    }
+
+    /// The row-by-row path: every row one fused decode step (the batched pass's reference).
+    pub fn predictRows(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32) !void {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
         try e.grow(ids.len);
         var pass = Pass{
@@ -360,7 +431,7 @@ pub const Engine = struct {
             .up_fn = e.up_fn,
             .down_fn = e.down_fn,
         };
-        try forward(Tri, &pass, tri, &e.layers, ids, seq.fed);
+        try forwardRows(Tri, &pass, tri, &e.layers, ids, seq.fed);
         seq.fed += ids.len;
     }
 };
@@ -415,6 +486,8 @@ pub fn run(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cuda
     const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
     out[0] = argmax(seq.logits);
     printTop(seq.logits);
+    // TF_FLASHNEXT_LOGITS=path: the prompt's last row of scores (bf16), to compare the two paths byte for byte
+    if (std.c.getenv("TF_FLASHNEXT_LOGITS")) |path| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(path), .data = seq.logits });
     std.debug.print("token {d}\n", .{out[0]});
     var tok = out[0];
     for (1..new_tokens) |i| {

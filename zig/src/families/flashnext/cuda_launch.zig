@@ -229,22 +229,49 @@ pub const Tri = struct {
 
     /// moe.router for one decode row. M folds to a constexpr. 513 rows: the experts, then the shared gate.
     pub fn router(t: Tri, x: u64, w: u64, out: u64, x_stride: usize) !void {
-        try t.run("_router", .{ 1, cdiv(513, 32), 1 }, &.{
-            p("X", "*bf16", x),
-            p("W", "*bf16", w),
-            p("OUT", "*fp32", out),
-            int("M", 1),
-            int("x_stride", x_stride),
-        }, &.{ ci("D", 2560), ci("NE", 513), ci("BM", 16), ci("BLOCK_E", 32), ci("BK", 256) });
+        try t.routerMany(x, w, out, x_stride, 1);
     }
 
     /// moe._topk_rows: one program, the row's 10 experts and the shared expert.
     pub fn topkRows(t: Tri, logits: u64, pick: u64, wts: u64) !void {
-        try t.run("_topk_rows", .{ 1, 1, 1 }, &.{
+        try t.topkMany(logits, pick, wts, 1);
+    }
+
+    /// moe._topk_rows over `rows` rows of [rows, 513] logits: picks and weights [rows, 11].
+    pub fn topkMany(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize) !void {
+        try t.run("_topk_rows", .{ u(rows), 1, 1 }, &.{
             p("L", "*fp32", logits),
             p("PICK", "*i32", pick),
             p("WTS", "*fp32", wts),
         }, &.{ ci("NE", 512), ci("NL", 513), ci("TOPK", 10), ci("SLOTS", 11), ci("BLOCK", 1024), ci("SLOTP", 16) });
+    }
+
+    /// moe.router over `rows` rows at the one-row tiles (BM 16, BLOCK_E 32, BK 256): M folds when it is 1, and
+    /// capture_rows.py's M > 1 forms keep each row's bits.
+    pub fn routerMany(t: Tri, x: u64, w: u64, out: u64, x_stride: usize, rows: usize) !void {
+        try t.run("_router", .{ cdiv(rows, 16), cdiv(513, 32), 1 }, &.{
+            p("X", "*bf16", x),
+            p("W", "*bf16", w),
+            p("OUT", "*fp32", out),
+            int("M", rows),
+            int("x_stride", x_stride),
+        }, &.{ ci("D", 2560), ci("NE", 513), ci("BM", 16), ci("BLOCK_E", 32), ci("BK", 256) });
+    }
+
+    /// qmm._qmm on tiled weights at the 16-row shape constants of the hyper-connection up projection (SK 1, GPI 2):
+    /// the up rows _qmm_upmix mixes, for a training pass that keeps them. capture_rows.py's forms (M > 1).
+    pub fn upRows(t: Tri, x: u64, xs: u64, weight: u64, scales: u64, biases: u64, out: u64, rows: usize, n: usize, k: usize) !void {
+        try t.run("_qmm", .{ cdiv(rows, 16), cdiv(n, 64), 1 }, &.{
+            p("X", "*bf16", x),
+            p("XS", "*fp32", xs),
+            p("W", "*i32", weight),
+            p("S", "*bf16", scales),
+            p("B", "*bf16", biases),
+            p("OUT", "*bf16", out),
+            p("PART", "*bf16", out),
+            int("M", rows),
+            int("x_stride", k),
+        }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 16), ci("BLOCK_N", 64), ci("GPI", 2), ci("F32", 0), ci("SBN", 64) });
     }
 };
 
@@ -259,6 +286,7 @@ test {
     _ = ple;
     _ = mix;
     _ = prompt;
+    _ = prompt.batch;
     _ = native;
 }
 

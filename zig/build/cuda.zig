@@ -14,6 +14,7 @@ const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=t
 const kernels = [_]Kernel{
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
     .{ .name = "flashnext_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.cu chain, one row
+    .{ .name = "flashnext_batch", .flags = &.{ "-O3", "--fmad=false" } }, // ours: Flash Next's batched prompt pass glue
     .{ .name = "probe", .flags = &.{"-O3"} },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py lane matmul, groups of 32
@@ -157,6 +158,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const prompt_count = b.option([]const u8, "flashnext_count", "greedy tokens to emit") orelse "8";
     if (embed_model != null and embed_kernels != null and prompt_ids != null) prompt_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.?, prompt_count });
     b.step("flashnext-prompt", "Run one Flash Next prompt on the captured CUDA kernels").dependOn(&prompt_run.step);
+    const batch_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_batch_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    batch_check.addImport("cuda", cuda);
+    batch_check.addImport("flashnext", mods.flashnext);
+    const batch_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-batch", .root_module = batch_check }));
+    if (embed_model != null and embed_kernels != null and prompt_ids != null) batch_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.? });
+    b.step("flashnext-batch", "The Flash Next batched pass's training hooks (keeps, taps, nudges, every row's head) on one prompt").dependOn(&batch_run.step);
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, mods.living, build_options, true).root_module.strip = strip;
 }
 
