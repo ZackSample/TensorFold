@@ -20,6 +20,7 @@ pub const native = @import("cuda_native.zig");
 pub const train = @import("cuda_train.zig");
 pub const sites = @import("cuda_sites.zig");
 pub const train_ops = @import("cuda_train_ops.zig");
+pub const fn_back = @import("cuda_fn_back.zig");
 pub const glue = @import("cuda_glue.zig");
 pub const glue_ref = @import("glue_ref.zig");
 pub const glue_math = @import("glue_math.zig");

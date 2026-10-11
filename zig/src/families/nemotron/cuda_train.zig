@@ -191,7 +191,7 @@ pub const Trainer = struct {
     /// Every buffer a step needs and the raw weights its backward reads; `living`, saved blocks the trainer takes over.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *engine.Engine, dir: []const u8, living: *?sites_mod.Sites) !*Trainer {
         const c = e.c;
-        if (c.mamba_head_dim != 64 or c.state != 128 or c.top_k > 16 or c.experts > 256) return error.UnsupportedShape;
+        if (c.mamba_head_dim != 64 or c.state != 128 or c.top_k > 16 or c.experts > 1024) return error.UnsupportedShape;
         const d = e.ctx.d;
         const t = try gpa.create(Trainer);
         errdefer gpa.destroy(t);
