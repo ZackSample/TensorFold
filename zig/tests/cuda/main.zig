@@ -22,6 +22,7 @@ const nvfp4_tests = @import("nvfp4_tests.zig");
 const modelopt_tests = @import("modelopt_tests.zig");
 const train_pack = @import("train_pack.zig");
 const fn_back_tests = @import("fn_back_tests.zig");
+const gdn_back_tests = @import("gdn_back_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -57,6 +58,7 @@ const usage =
     \\  fn-attn-back              Flash Next's gated attention backward (24 heads, 2 kv, dim 256, RoPE) against float64
     \\  fn-head-back              the loss through Flash Next's 4-bit head (vocab 248320) and final mixer against float64
     \\  fn-back                   all four fn-*-back cases
+    \\  gdn-back                  Flash Next's DeltaNet backward (Living Weights) against float64 references (synthetic)
     \\
 ;
 
@@ -127,6 +129,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fn-attn-back")) return fn_back_tests.run(gpu, .attn);
     if (std.mem.eql(u8, cmd, "fn-head-back")) return fn_back_tests.run(gpu, .head);
     if (std.mem.eql(u8, cmd, "fn-back")) return fn_back_tests.run(gpu, .all);
+    if (std.mem.eql(u8, cmd, "gdn-back")) return gdn_back_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;

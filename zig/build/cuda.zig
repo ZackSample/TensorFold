@@ -31,6 +31,7 @@ const kernels = [_]Kernel{
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "flashnext_train_mix", .flags = &.{"-O3"} }, // ours: Flash Next's input gradients for Living Weights
+    .{ .name = "flashnext_train", .flags = &.{ "-O3", "--fmad=false" } }, // ours: Living Weights' DeltaNet backward (gdn_train.zig)
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_route", .flags = glue },
     .{ .name = "nemotron_mamba", .flags = glue },

@@ -31,6 +31,7 @@ pub const nvfp4_experts: []const u8 = if (available) &Blob("fatbin_nvfp4_experts
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
 pub const flashnext_train_mix: []const u8 = if (available) &Blob("fatbin_flashnext_train_mix").bytes else &.{};
+pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
 pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};
 pub const prompt16: []const u8 = if (available) &Blob("fatbin_prompt16").bytes else &.{};
 pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
