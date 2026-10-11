@@ -21,6 +21,7 @@ const carveout_tests = @import("carveout_tests.zig");
 const nvfp4_tests = @import("nvfp4_tests.zig");
 const modelopt_tests = @import("modelopt_tests.zig");
 const train_pack = @import("train_pack.zig");
+const fn_back_tests = @import("fn_back_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -51,6 +52,11 @@ const usage =
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
     \\  modelopt                  ModelOpt repack, FP8 and BF16 lane rows and relu^2 NVFP4 experts against fp64
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+    \\  fn-hc-back                Flash Next's hyper-connection backward (block and final mixer) against float64, 64 and 256 rows
+    \\  fn-moe-back               Flash Next's MoE backward (512 experts, shared expert, router, pocket) against float64
+    \\  fn-attn-back              Flash Next's gated attention backward (24 heads, 2 kv, dim 256, RoPE) against float64
+    \\  fn-head-back              the loss through Flash Next's 4-bit head (vocab 248320) and final mixer against float64
+    \\  fn-back                   all four fn-*-back cases
     \\
 ;
 
@@ -116,6 +122,11 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         const mib = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else cuda.carveout.default_bytes >> 20;
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
+    if (std.mem.eql(u8, cmd, "fn-hc-back")) return fn_back_tests.run(gpu, .hc);
+    if (std.mem.eql(u8, cmd, "fn-moe-back")) return fn_back_tests.run(gpu, .moe);
+    if (std.mem.eql(u8, cmd, "fn-attn-back")) return fn_back_tests.run(gpu, .attn);
+    if (std.mem.eql(u8, cmd, "fn-head-back")) return fn_back_tests.run(gpu, .head);
+    if (std.mem.eql(u8, cmd, "fn-back")) return fn_back_tests.run(gpu, .all);
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
