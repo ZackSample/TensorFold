@@ -1,4 +1,4 @@
-//! Flash Next's input-gradient kernels (flashnext_train_mix.cu, nemotron.fn_back) at the model's shapes against float64
+//! Flash Next's input-gradient kernels (flashnext_train_mix.cu, flashnext.fn_back) at the model's shapes against float64
 //! references, each reference first checked against central differences of a float64 forward: the hyper-connections
 //! (`fn-hc-back`), the MoE layer with its shared expert and pocket (`fn-moe-back`), the gated attention
 //! (`fn-attn-back`) and the loss through the 4-bit head into the final mixer (`fn-head-back`), at 64 and 256 rows.
@@ -6,10 +6,10 @@
 //! value) and its relative L2 error; synthetic weights, a few GB of GPU memory at most.
 const std = @import("std");
 const cuda = @import("cuda");
-const nemotron = @import("nemotron");
+const flashnext = @import("flashnext");
 const check = @import("check.zig");
 const Gpu = check.Gpu;
-const fb = nemotron.fn_back;
+const fb = flashnext.fn_back;
 const Ops = fb.Ops;
 
 const D = 2560;
