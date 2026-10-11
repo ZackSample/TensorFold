@@ -13,7 +13,7 @@ const state = @import("cuda_state.zig");
 const config = @import("config.zig");
 const seq_graphs = @import("cuda_seq_graphs.zig");
 const costs = @import("cuda_costs.zig");
-const lesson_route = @import("lesson_route.zig");
+const lesson_route = @import("living").lesson_route;
 
 const be = lanes.backend;
 const LogRow = lanes.LogprobRow;

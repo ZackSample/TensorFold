@@ -12,7 +12,7 @@ const Sampling = @import("lanes").sampling.Sampling;
 const fullVocabulary = @import("lanes").gpu_full.fullVocabulary;
 const row = @import("../../core/row_projection.zig");
 const Masks = @import("../../core/grammar_mask.zig").Masks;
-const lesson_route = @import("lesson_route.zig");
+const lesson_route = @import("living").lesson_route;
 
 const Buffer = mtl.Buffer;
 pub const Enc = encoder.Enc;

@@ -1,4 +1,5 @@
 //! A measure, not a lesson: how far vectors fitted at one row of a few layers bring a fact's held-out answers back.
+//! Nemotron's Metal trainer only (TF_SLIDE_PROBE): it reads that trainer's config for its MoE layers.
 const std = @import("std");
 const examples = @import("lesson_examples.zig");
 const lesson_route = @import("lesson_route.zig");
