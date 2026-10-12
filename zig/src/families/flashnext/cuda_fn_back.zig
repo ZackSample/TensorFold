@@ -174,7 +174,9 @@ pub const Ops = struct {
     /// Scratch for one read-out's backward: dn and du [rows, S d], dact [rows, low], dv [rows, low + S] (fp32).
     pub const HcScratch = struct { dn: u64, du: u64, dact: u64, dv: u64 };
 
-    /// A block's write-back h' = h + bf16(branch inject) undone from g = dL/dh': dbranch [rows, d], dinject [rows, S].
+    /// A block's write-back undone from g = dL/dh': dbranch [rows, d], dinject [rows, S]. The captured _hc_writeback
+    /// computes h' = bf16(h + branch inject), the product fused into the add; rounding has no gradient, so this is the
+    /// gradient of that write-back as of glue.py's h + bf16(branch inject).
     pub fn hcBranchBack(o: Ops, hc: Hc, g: u64, inject: u64, branch: u64, dbranch: u64, dinject: u64, rows: usize) !void {
         var a: cuda.Args = .{};
         for ([_]u64{ g, inject, branch, dbranch, dinject }) |v| a.add(v);
