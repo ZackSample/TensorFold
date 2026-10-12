@@ -534,7 +534,7 @@ pub const Engine = struct {
             .k = &e.batch_k,
             .s = s,
             .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
-            .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .ks = seq.ks, .vs = seq.vs, .kv_bits = seq.kv_bits, .pooled = seq.pooled, .tail = seq.tail, .history = &seq.history, .cap = seq.cap, .scores = scores },
+            .seq = seq.view(scores),
             .hooks = with,
         };
         var at: usize = 0;
@@ -548,6 +548,45 @@ pub const Engine = struct {
         }
         if (hooks.logits == .none) try e.stream.synchronize();
         seq.fed += ids.len;
+    }
+
+    /// One decode round: each of `seqs` takes its token of `ids` at its own position, every row in one batched pass
+    /// (the stateless kernels over all rows, each stream's conv windows, states and caches its own), and its next
+    /// token's scores land in its `logits`, the bits a pass of that stream alone leaves. `out` is device scratch for
+    /// the rows' scores [seqs.len, vocab] bf16.
+    pub fn round(e: *Engine, comptime Tri: type, tri: Tri, seqs: []const *Seq, ids: []const u32, out: u64) !void {
+        if (seqs.len == 0 or seqs.len != ids.len) return error.UnexpectedTensor;
+        var cap: usize = 0;
+        for (seqs) |q| {
+            if (q.fed + 1 > q.cap) return error.UnexpectedTensor;
+            cap = @max(cap, q.cap);
+        }
+        const rows = try e.gpa.alloc(batch.Lane, seqs.len);
+        defer e.gpa.free(rows);
+        const s = try e.reserve(seqs.len);
+        // each row's attention runs alone on the block scores
+        const scores = try e.reserveScores(cap, 1);
+        for (rows, seqs) |*l, q| l.* = .{ .seq = q.view(scores), .pos = q.fed };
+        var p: batch.Pass(Tri) = .{
+            .gpa = e.gpa,
+            .io = e.io,
+            .stream = e.stream.*,
+            .tri = tri,
+            .k = &e.batch_k,
+            .s = s,
+            .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
+            .seq = rows[0].seq,
+            .lanes = rows,
+            // a taught folder's pockets, row-wise like every other launch of the round
+            .hooks = .{ .logits = .all, .logits_out = out, .moe_add = if (e.pocketed()) .{ .ctx = e, .add = servePocket } else null },
+        };
+        try p.chunk(ids, 0, null);
+        try e.stream.synchronize();
+        const d = e.stream.d;
+        for (seqs, 0..) |q, r| {
+            try d.check(d.api.cuMemcpyDtoH_v2(q.logits.ptr, out + r * vocab * 2, vocab * 2), "cuMemcpyDtoH");
+            q.fed += 1;
+        }
     }
 
     /// The row-by-row path: every row one fused decode step (the batched pass's reference).
@@ -605,6 +644,11 @@ pub const Seq = struct {
     fed: usize,
     logits: []u8,
     cap: usize,
+
+    /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
+    pub fn view(s: *Seq, scores: u64) batch.SeqState {
+        return .{ .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .ks = s.ks, .vs = s.vs, .kv_bits = s.kv_bits, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores };
+    }
 
     pub fn deinit(s: *Seq, gpa: std.mem.Allocator) void {
         freeBufs(s.conv);

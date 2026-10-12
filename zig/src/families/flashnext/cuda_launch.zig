@@ -353,6 +353,7 @@ test {
     _ = prompt.batch;
     _ = mtp;
     _ = native;
+    _ = @import("cuda_snap.zig");
 }
 
 test "embed grid is one program per row and per group of 32" {

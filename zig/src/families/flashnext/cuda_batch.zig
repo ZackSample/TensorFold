@@ -351,7 +351,7 @@ pub const Scratch = struct {
         const nblk = cdiv(pairs, plan_small);
         const items = cdiv(pairs, tile) + experts_n + 1;
         var n: usize = 0;
-        n += cap * 4 + (cdiv(cap, att_rows) + 1) * 16;
+        n += cap * 4 + (cap + 1) * 16;
         n += cap * wide * 2 * 2 + cap * pss_n * 4 + cap * (low + 4) * 2 + hc_sk * cap * (low + 4) * 4;
         n += cap * low * 2 + cap * (low / 32) * 4 + cap * streams * 2 + cap * dims * 2 + cap * (dims / 32) * 4;
         n += cap * proj_row * 2 + out_sk * cap * dims * 4 + cap * gdn.value_dim * (2 + 4 + 4) + cap * (gdn.value_dim / 32) * 4;
@@ -373,7 +373,8 @@ pub const Scratch = struct {
         const nblk = cdiv(pairs, plan_small);
         const items = cdiv(pairs, tile) + experts_n + 1;
         s.ids = try s.add(gpa, d, cap * 4);
-        s.pos = try s.add(gpa, d, (cdiv(cap, att_rows) + 1) * 16);
+        // a position every 16 bytes: one a block of att_rows rows, or one a row of a decode round
+        s.pos = try s.add(gpa, d, (cap + 1) * 16);
         s.h = try s.add(gpa, d, cap * wide * 2);
         s.pss = try s.add(gpa, d, cap * pss_n * 4);
         s.norm = try s.add(gpa, d, cap * wide * 2);
@@ -474,6 +475,9 @@ pub fn scoreBytes(cap: usize, rows: usize) usize {
     return @min(rows, att_rows) * scoreStride(cap) * 4;
 }
 
+/// One row of a decode round: its stream's next token, on that stream's own caches at its own position.
+pub const Lane = struct { seq: SeqState, pos: usize };
+
 /// The engine's resident weights the pass reads.
 pub const Model = struct {
     table_w: u64,
@@ -504,6 +508,9 @@ pub fn Pass(comptime Tri: type) type {
         m: Model,
         seq: SeqState,
         hooks: Hooks,
+        /// A decode round: row r is lanes[r]'s token (its own conv windows, states, caches and n-gram tail and
+        /// history, at its own position), the stateless kernels shared over every row. Empty: the rows continue `seq`.
+        lanes: []const Lane = &.{},
         rows: usize = 0,
         pos0: usize = 0,
         /// The MoE write-back the next layer (or the head) applies first, and the layer it came from.
@@ -645,8 +652,17 @@ pub fn Pass(comptime Tri: type) type {
             try self.lane(s.ple_emb, s.ple_xs, lw.val, s.dummy, s.ple_part, n, 4);
             try self.sumSlices(s.ple_part, s.ple_vals, true, n * dims, 4);
             try self.tri.pleGate(s.ple_keys, s.ple_vals, s.h, lw.nk.ptr, lw.nq.ptr, s.ple_gated, s.ple_pss, eps, n, dims, streams);
-            try self.tri.pleConv(s.ple_gated, s.ple_pss, lw.nc.ptr, self.seq.tail.ptr, lw.ple_cw.ptr, s.h, s.h, s.ple_nrow, eps, n, dims, streams, 4, 3);
-            try self.shiftWindow(self.seq.tail.ptr, s.ple_nrow, wide, n, ple_tail_n, wide);
+            if (self.lanes.len == 0) {
+                try self.tri.pleConv(s.ple_gated, s.ple_pss, lw.nc.ptr, self.seq.tail.ptr, lw.ple_cw.ptr, s.h, s.h, s.ple_nrow, eps, n, dims, streams, 4, 3);
+                try self.shiftWindow(self.seq.tail.ptr, s.ple_nrow, wide, n, ple_tail_n, wide);
+                return;
+            }
+            // a round: each row's convolution over its own stream's tail, the one-row launch a lone decode makes
+            for (self.lanes, 0..) |l, r| {
+                const g = r * wide * 2;
+                try self.tri.pleConv(s.ple_gated + g, s.ple_pss + r * streams * 4, lw.nc.ptr, l.seq.tail.ptr, lw.ple_cw.ptr, s.h + g, s.h + g, s.ple_nrow + g, eps, 1, dims, streams, 4, 3);
+                try self.shiftWindow(l.seq.tail.ptr, s.ple_nrow + g, wide, 1, ple_tail_n, wide);
+            }
         }
 
         fn gdnBlock(self: *Self, lw: *const Layer, li: usize, keep: LayerKeep) !void {
@@ -657,28 +673,18 @@ pub fn Pass(comptime Tri: type) type {
             try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
             try self.copy(keep.state, self.seq.state[li].ptr, state_n * 4);
             // every row's conv, norms and gates at once, then the recurrence (a warp's 4 state rows each, 16 a block),
-            // then the gated norm per row: the one-block chain's bits (flashnext_batch.cu)
-            var f: cuda.Args = .{};
-            f.add(s.proj);
-            f.add(self.seq.conv[li].ptr);
-            f.add(lw.cw.ptr);
-            f.add(lw.a_log.ptr);
-            f.add(lw.dt.ptr);
-            f.add(s.gq);
-            f.add(s.gk);
-            f.add(s.gv);
-            f.add(s.ggb);
-            try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(n), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
-            var a: cuda.Args = .{};
-            a.add(s.gq);
-            a.add(s.gk);
-            a.add(s.gv);
-            a.add(s.ggb);
-            a.add(self.seq.state[li].ptr);
-            if (keep.state_out != 0) a.add(keep.state_out);
-            a.add(cint(n));
-            a.add(s.ys);
-            try cuda.launch.launch(if (keep.state_out != 0) self.k.chain_to else self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
+            // then the gated norm per row: the one-block chain's bits (flashnext_batch.cu); a round runs each row's
+            // front and recurrence on its own stream's conv window and state, as a lone decode's one-row launches
+            if (self.lanes.len == 0) {
+                try self.gdnFront(lw, s.proj, self.seq.conv[li].ptr, n, s.gq, s.gk, s.gv, s.ggb);
+                try self.gdnChain(s.gq, s.gk, s.gv, s.ggb, self.seq.state[li].ptr, keep.state_out, n, s.ys);
+            } else for (self.lanes, 0..) |l, r| {
+                const qk = r * gdn.nk * gdn.dk * 4;
+                const v = r * gdn.value_dim * 4;
+                const gb = r * gdn.nv * 2 * 4;
+                try self.gdnFront(lw, s.proj + r * gdn.proj_width * 2, l.seq.conv[li].ptr, 1, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
+                try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, 0, 1, s.ys + v);
+            }
             var b: cuda.Args = .{};
             b.add(s.ys);
             b.add(s.proj);
@@ -687,8 +693,42 @@ pub fn Pass(comptime Tri: type) type {
             b.add(s.gout);
             b.add(s.gxs);
             try cuda.launch.launch(self.k.gnorm, .{ .grid = .{ .x = @intCast(n), .y = gdn.nv }, .block = .{ .x = gdn.dv } }, self.stream, &b);
-            try self.shiftWindow(self.seq.conv[li].ptr, s.proj, gdn.proj_width, n, gdn.taps - 1, gdn.conv_dim);
+            if (self.lanes.len == 0) {
+                try self.shiftWindow(self.seq.conv[li].ptr, s.proj, gdn.proj_width, n, gdn.taps - 1, gdn.conv_dim);
+            } else for (self.lanes, 0..) |l, r| {
+                try self.shiftWindow(l.seq.conv[li].ptr, s.proj + r * gdn.proj_width * 2, gdn.proj_width, 1, gdn.taps - 1, gdn.conv_dim);
+            }
             try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
+        }
+
+        /// fn_gdn_front over `rows` projection rows after the conv window `conv`.
+        fn gdnFront(self: *Self, lw: *const Layer, proj: u64, conv: u64, rows: usize, gq: u64, gk: u64, gv: u64, ggb: u64) !void {
+            var f: cuda.Args = .{};
+            f.add(proj);
+            f.add(conv);
+            f.add(lw.cw.ptr);
+            f.add(lw.a_log.ptr);
+            f.add(lw.dt.ptr);
+            f.add(gq);
+            f.add(gk);
+            f.add(gv);
+            f.add(ggb);
+            try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(rows), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
+        }
+
+        /// fn_gdn_rows: the recurrence over `rows` rows from `state` (left after the last, or with `state_out` there:
+        /// fn_gdn_rows_to, `state` untouched), each readout into ys.
+        fn gdnChain(self: *Self, gq: u64, gk: u64, gv: u64, ggb: u64, state: u64, state_out: u64, rows: usize, ys: u64) !void {
+            var a: cuda.Args = .{};
+            a.add(gq);
+            a.add(gk);
+            a.add(gv);
+            a.add(ggb);
+            a.add(state);
+            if (state_out != 0) a.add(state_out);
+            a.add(cint(rows));
+            a.add(ys);
+            try cuda.launch.launch(if (state_out != 0) self.k.chain_to else self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
         }
 
         pub fn attnBlock(self: *Self, lw: *const Layer, ai: usize, keep: LayerKeep) !void {
@@ -699,6 +739,34 @@ pub fn Pass(comptime Tri: type) type {
             if (keep.pq != 0) try self.copy2d(false, pa, proj_n, keep.pq, q_heads * 2 * head_dim, q_heads * 2 * head_dim, n, 0);
             if (keep.pk != 0) try self.copy2d(false, pa + q_heads * 2 * head_dim * 2, proj_n, keep.pk, kv_heads * head_dim, kv_heads * head_dim, n, 0);
             if (keep.pv != 0) try self.copy2d(false, pa + (q_heads * 2 + kv_heads) * head_dim * 2, proj_n, keep.pv, kv_heads * head_dim, kv_heads * head_dim, n, 0);
+            if (self.lanes.len > 0) {
+                // a round: each row's rope, cache writes, block selection and attention over its own stream's caches
+                // at its position: the launches a lone decode makes
+                const own_seq = self.seq;
+                const own_pos0 = self.pos0;
+                defer {
+                    self.seq = own_seq;
+                    self.pos0 = own_pos0;
+                }
+                for (self.lanes, 0..) |l, r| {
+                    self.seq = l.seq;
+                    self.pos0 = l.pos;
+                    try self.attnRows(lw, ai, pa + r * proj_n * 2, 1, .{ .pos = s.pos + r * 16, .q = s.q + r * q_heads * head_dim * 2, .iq = s.iq + r * index_heads * index_dim * 2, .ao = s.ao + r * out_k * 2 });
+                }
+            } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao });
+            const gated = if (keep.gated != 0) keep.gated else s.gated;
+            try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, proj_n, q_heads, head_dim);
+            try self.lane(gated, s.gxs_attn, lw.out, s.dummy, s.part, n, out_sk);
+        }
+
+        /// Where attnRows reads its rows' positions (one int a block of att_rows rows, 16 bytes apart) and writes
+        /// their queries, indexer queries and outputs.
+        const RowsAt = struct { pos: u64, q: u64, iq: u64, ao: u64 };
+
+        /// `n` rows of self.seq from self.pos0: rope and cache writes for all, the blocks they complete pooled, then
+        /// each block of att_rows rows' block scores, selection and attention over its rows' keys.
+        fn attnRows(self: *Self, lw: *const Layer, ai: usize, pa: u64, n: usize, at: RowsAt) !void {
+            const s = self.s;
             const kc = self.seq.kc[ai].ptr;
             const vc = self.seq.vc[ai].ptr;
             const ikc = self.seq.ikc[ai].ptr;
@@ -706,10 +774,10 @@ pub fn Pass(comptime Tri: type) type {
             const bits = self.seq.kv_bits;
             const ks = if (bits != 0) self.seq.ks[ai].ptr else s.dummy;
             const vs = if (bits != 0) self.seq.vs[ai].ptr else s.dummy;
-            try self.tri.attnPrep(pa, s.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, kc, vc, ks, vs, s.iq, ikc, s.dummy, s.dummy, eps, n, 0, bits);
+            try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, ks, vs, at.iq, ikc, s.dummy, s.dummy, eps, n, 0, bits);
             // attention.qsa_pool: the blocks these rows complete, then (as forward.attn_block's prompt blocks) each
             // block of rows' scores, selection and attention over its rows' keys
-            try self.tri.qsaPool(ikc, pooled, s.pos, lw.ik_scale.ptr, s.inv, eps, n);
+            try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n);
             const nb = scoreStride(self.seq.cap);
             var r0: usize = 0;
             var b: usize = 0;
@@ -720,8 +788,8 @@ pub fn Pass(comptime Tri: type) type {
                 const m = @min(att_rows, n - r0);
                 const ends = self.pos0 + r0 + m;
                 if (ends > self.seq.cap) return error.UnexpectedTensor;
-                const pos = s.pos + b * 16;
-                const iq = s.iq + r0 * index_heads * index_dim * 2;
+                const pos = at.pos + b * 16;
+                const iq = at.iq + r0 * index_heads * index_dim * 2;
                 // rows past `top` complete blocks score theirs; _scores leaves the rest alone, so skip it when none is
                 if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)));
                 var a: cuda.Args = .{};
@@ -736,12 +804,9 @@ pub fn Pass(comptime Tri: type) type {
                 a.add(cint(ratio));
                 try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
                 const chunks = cdiv(@min(ends, wt.dense_keys), 512);
-                try self.tri.attnChunks(s.q + r0 * q_heads * head_dim * 2, kc, vc, ks, vs, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true, bits);
-                try self.tri.attnMerge(s.po, s.pm, s.pl, pos, s.ao + r0 * out_k * 2, s.qnk, s.qspr, m, kv_heads, true, bits);
+                try self.tri.attnChunks(at.q + r0 * q_heads * head_dim * 2, kc, vc, ks, vs, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true, bits);
+                try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * out_k * 2, s.qnk, s.qspr, m, kv_heads, true, bits);
             }
-            const gated = if (keep.gated != 0) keep.gated else s.gated;
-            try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, proj_n, q_heads, head_dim);
-            try self.lane(gated, s.gxs_attn, lw.out, s.dummy, s.part, n, out_sk);
         }
 
         /// Router, each row's ten experts and the shared one, the grouped expert launches: y [rows, 11, dims] fp32.
@@ -839,12 +904,12 @@ pub fn Pass(comptime Tri: type) type {
             defer self.gpa.free(id32);
             for (id32, ids) |*o, v| o.* = @intCast(v);
             try self.upload(s.ids, std.mem.sliceAsBytes(id32));
-            const blocks = cdiv(n, att_rows);
-            // one int a block, 16 bytes apart: _chunks and _merge take POS0 16-byte aligned
+            const blocks = if (self.lanes.len > 0) n else cdiv(n, att_rows);
+            // one int a block (a round: a row), 16 bytes apart: _chunks and _merge take POS0 16-byte aligned
             const pos = try self.gpa.alloc(i32, blocks * 4);
             defer self.gpa.free(pos);
             @memset(pos, 0);
-            for (0..blocks) |b| pos[4 * b] = @intCast(self.pos0 + b * att_rows);
+            for (0..blocks) |b| pos[4 * b] = @intCast(if (self.lanes.len > 0) self.lanes[b].pos else self.pos0 + b * att_rows);
             try self.upload(s.pos, std.mem.sliceAsBytes(pos));
         }
 
@@ -858,13 +923,24 @@ pub fn Pass(comptime Tri: type) type {
             failed: ?anyerror = null,
             ns: i96 = 0,
             io: std.Io,
+            /// A round's rows, each gathered after its own stream's history (empty: every row after `history`).
+            lanes: []const Lane = &.{},
 
             fn main(g: *Gather) void {
                 const t0 = std.Io.Clock.awake.now(g.io).toNanoseconds();
-                g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
-                    g.failed = err;
-                };
-                g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
+                defer g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
+                if (g.lanes.len == 0) {
+                    g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
+                        g.failed = err;
+                    };
+                    return;
+                }
+                for (g.lanes, 0..) |l, r| {
+                    g.ngram.rows(l.seq.history[0..], g.ids[r..][0..1], g.emb[r * dims ..][0..dims], g.xs[r * (dims / 32) ..][0 .. dims / 32]) catch |err| {
+                        g.failed = err;
+                        return;
+                    };
+                }
             }
         };
 
@@ -877,7 +953,12 @@ pub fn Pass(comptime Tri: type) type {
                 self.stream.synchronize() catch {};
                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
             };
-            if (n == 0 or n > s.cap or pos0 + n > self.seq.cap) return error.UnexpectedTensor;
+            if (n == 0 or n > s.cap) return error.UnexpectedTensor;
+            if (self.lanes.len > 0) {
+                // a round reads every row's scores and keeps nothing for a backward (a pocket's moe_add is row-wise)
+                if (n != self.lanes.len or self.hooks.logits != .all or self.hooks.keep != null or self.hooks.nudge != null or self.hooks.taps != null or self.hooks.streams != 0) return error.UnexpectedTensor;
+                for (self.lanes) |l| if (l.pos + 1 > l.seq.cap) return error.UnexpectedTensor;
+            } else if (pos0 + n > self.seq.cap) return error.UnexpectedTensor;
             self.rows = n;
             self.pos0 = pos0;
             self.pending = null;
@@ -886,7 +967,7 @@ pub fn Pass(comptime Tri: type) type {
             defer self.gpa.free(emb);
             const xs = try self.gpa.alloc(f32, n * (dims / 32));
             defer self.gpa.free(xs);
-            var gather: Gather = .{ .ngram = self.m.ngram, .history = self.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = self.io };
+            var gather: Gather = .{ .ngram = self.m.ngram, .history = self.seq.history[0..], .ids = ids, .emb = emb, .xs = xs, .io = self.io, .lanes = self.lanes };
             var thread: ?std.Thread = try std.Thread.spawn(.{}, Gather.main, .{&gather});
             defer if (thread) |th| th.join();
             try self.stage(ids);
