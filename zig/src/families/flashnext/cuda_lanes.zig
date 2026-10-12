@@ -32,7 +32,7 @@ pub fn Namespace(comptime Tri: type) type {
             backend: be.Backend,
             facts: lanes.Model,
             rows: u32,
-            /// Device bytes each admitted stream allocates: its own caches at the server's window (and the pass's scratch).
+            /// Device bytes each admitted stream allocates: its own caches at the server's window.
             stream_bytes: usize,
             /// Every stream allocates its own sequence; none rides on the engine's.
             free_streams: u32 = 0,
@@ -177,6 +177,9 @@ pub fn Namespace(comptime Tri: type) type {
             errdefer own.set.deinit();
             own.engine = try prompt.Engine.init(gpa, io, driver, &own.stream, dir);
             errdefer own.engine.deinit();
+            // the batched pass's scratch for a prompt filling the window, once for the engine (every stream's
+            // prompt, window and head pass runs on it): allocated now, inside the load's reserve
+            _ = try own.engine.reserve(@min(o.context, prompt.batch.default_chunk));
             // the MTP head unless --no-drafts (TF_FLASHNEXT_DRAFTS and _CONFIDENCE: the chain's rule, 6 and 0.60)
             if (o.drafts) {
                 own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
@@ -185,13 +188,13 @@ pub fn Namespace(comptime Tri: type) type {
             }
             errdefer if (own.head) |h| h.deinit();
             const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
-            var stream_bytes = prompt.seqBytes(window) + prompt.batch.Scratch.bytes(@min(o.context, prompt.batch.default_chunk));
+            var stream_bytes = prompt.seqBytes(window);
             if (own.head) |h| stream_bytes += mtp.Draft.bytes(window, h.ids.len);
             return .{
                 .backend = own.backend(),
                 .facts = own.facts(),
                 .rows = if (own.head != null) mtp.max_rows else 1,
-                // the stream's caches and the batched pass's scratch for a prompt filling the window (one stream)
+                // the stream's caches (and with the head, its cache and a window's buffers)
                 .stream_bytes = stream_bytes,
                 .ctx = own,
                 .deinit = release,

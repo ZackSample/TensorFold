@@ -48,16 +48,6 @@ fn down(d: *const cuda.Driver, gpa: std.mem.Allocator, ptr: u64, len: usize) ![]
     return out;
 }
 
-fn hcKeep(b: *Bufs, rows: usize, inject: bool) !batch.HcKeep {
-    return .{
-        .h = try b.get(rows * wide * 2),
-        .normed = try b.get(rows * wide * 2),
-        .v = try b.get(rows * (320 + 4) * 4),
-        .up = try b.get(rows * wide * 2),
-        .inject = if (inject) try b.get(rows * 4 * 2) else 0,
-    };
-}
-
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -96,27 +86,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var bufs: Bufs = .{ .gpa = gpa, .d = &driver };
     defer bufs.deinit();
-    var keep: batch.Keep = .{};
-    for (&keep.layers, 0..) |*k, l| {
-        k.attn_hc = try hcKeep(&bufs, n, true);
-        k.mlp_hc = try hcKeep(&bufs, n, true);
-        k.mix_branch = try bufs.get(n * dims * 2);
-        k.moe_branch = try bufs.get(n * dims * 2);
-        k.moe_x = try bufs.get(n * dims * 2);
-        k.moe_ids = try bufs.get(n * 11 * 4);
-        k.moe_wts = try bufs.get(n * 11 * 4);
-        if (l % 4 == 3) {
-            k.pq = try bufs.get(n * 12288 * 2);
-            k.pk = try bufs.get(n * 512 * 2);
-            k.pv = try bufs.get(n * 512 * 2);
-            k.gated = try bufs.get(n * 6144 * 2);
-        } else {
-            k.proj = try bufs.get(n * 16480 * 2);
-            k.hist = try bufs.get(3 * 10240 * 2);
-            k.state = try bufs.get(48 * 128 * 128 * 4);
-        }
-    }
-    keep.mixer = try hcKeep(&bufs, n, false);
+    var store = try batch.KeepStore.init(gpa, &driver, n);
+    defer store.deinit(gpa);
+    var keep = store.keep;
     var nudges: [layers_n]u64 = undefined;
     const zero = try bufs.get(n * dims * 4);
     for (&nudges) |*p| p.* = zero;
@@ -132,9 +104,7 @@ pub fn main(init: std.process.Init) !u8 {
     try e.forward(flash.Tri, tri, &seq, ids.items, .{ .logits = .all, .logits_out = all, .keep = &keep, .nudge = &nudges, .taps = taps });
     try stream.synchronize();
     const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
-    var kept: usize = 0;
-    for (bufs.list.items) |x| kept += x.len;
-    std.debug.print("keeping pass: {d} rows in {d:.1} ms, {d} MiB of keeps, taps, nudges and scores\n", .{ n, @as(f64, @floatFromInt(t1 - t0)) / 1e6, kept >> 20 });
+    std.debug.print("keeping pass: {d} rows in {d:.1} ms, {d} MiB kept ({d:.2} MiB a row)\n", .{ n, @as(f64, @floatFromInt(t1 - t0)) / 1e6, store.bytes >> 20, @as(f64, @floatFromInt(store.bytes)) / @as(f64, @floatFromInt(n)) / (1 << 20) });
     var failures: usize = 0;
 
     // (1) zero nudges, every row's head: the last row's scores are the prompt pass's

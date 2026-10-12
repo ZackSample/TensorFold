@@ -428,7 +428,7 @@ pub fn Ops(comptime Tri: type) type {
             if (next.len == 0) return;
             if (d.len + next.len > d.cap or d.len + next.len > wt.nch * 512) return error.PromptTooLong;
             const want = @max(@as(usize, 32), 2 * @min(next.len, piece_rows));
-            const s = try e.batchScratch(want);
+            const s = try e.reserve(want);
             const piece = @max(@as(usize, 1), @min(piece_rows, s.cap / 2));
             var p: batch.Pass(Tri) = .{
                 .gpa = e.gpa,
@@ -633,6 +633,9 @@ pub const Stats = struct {
     drafted: usize = 0,
     accepted: usize = 0,
     ms: f64 = 0,
+    /// Wall time in the windows (forward and draws) and in the head (rollback, absorb, chain).
+    verify_ms: f64 = 0,
+    draft_ms: f64 = 0,
 };
 
 /// Python mtp_decode over a prefilled sequence: `out` holds the first token; decode until `count` tokens.
@@ -653,8 +656,12 @@ pub fn decode(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft, prom
         ids[0] = out.items[out.items.len - 1];
         @memcpy(ids[1..][0..ch.n], ch.slice());
         const rows = 1 + ch.n;
+        const tv = std.Io.Clock.awake.now(o.e.io).toNanoseconds();
         try o.verify(seq, d, ids[0..rows]);
         try o.draws(d, sm, sampled[0..rows]);
+        const td = std.Io.Clock.awake.now(o.e.io).toNanoseconds();
+        st.verify_ms += @as(f64, @floatFromInt(td - tv)) / 1e6;
+        defer st.draft_ms += @as(f64, @floatFromInt(std.Io.Clock.awake.now(o.e.io).toNanoseconds() - td)) / 1e6;
         var keep: usize = 1;
         for (ch.slice(), 0..) |t, i| {
             if (sampled[i] != t or isStop(stop, sampled[i])) break;
@@ -759,6 +766,7 @@ pub fn check(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cu
                 if (st.rounds > 0) n_got / @as(f64, @floatFromInt(st.rounds)) else 0.0,
                 if (equal) "same tokens" else "DIFFER",
             });
+            std.debug.print("  drafted rounds: {d:.2} ms a window ({d:.2} rows), {d:.2} ms in the head a round\n", .{ st.verify_ms / @as(f64, @floatFromInt(@max(st.rounds, 1))), @as(f64, @floatFromInt(st.rounds + st.drafted)) / @as(f64, @floatFromInt(@max(st.rounds, 1))), st.draft_ms / @as(f64, @floatFromInt(@max(st.rounds, 1))) });
             std.debug.print("serial ", .{});
             for (ref.items) |t| std.debug.print(" {d}", .{t});
             std.debug.print("\ndrafted", .{});
