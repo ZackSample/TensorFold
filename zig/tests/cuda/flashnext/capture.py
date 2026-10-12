@@ -76,6 +76,7 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=1536,
                     help="the cache window; 1025..1536 gives the port's NCH=3, QSA=0 attention specialization")
     ap.add_argument("--only", default="", help="comma list of prompt names (default: every prompt the context fits)")
+    ap.add_argument("--kv-dtype", default="bf16", help="the KV cache: bf16 (the port's default) or int8")
     ap.add_argument("--teachers", default="teacher,teacher32",
                     help="teacher paths to run after the served one (comma list of teacher, teacher32; empty: none)")
     a = ap.parse_args()
@@ -110,10 +111,11 @@ def main() -> int:
     t0 = time.perf_counter()
     with phase("startup"):
         eng = FlashNextEngine(model, depth=0, max_len=a.context, context_explicit=True, streams=1,
-                              ple_on_ssd=True, kv_dtype="bf16", graphs=False)
+                              ple_on_ssd=True, kv_dtype=a.kv_dtype, graphs=False)
     e = eng.e
     info = {"startup_s": round(time.perf_counter() - t0, 2), "max_len": eng.max_len, "prefill_rows": eng.prefill_rows,
             "nch": e.buf.attn.nch, "qsa": bool(e.buf.attn.qsa), "idw": e.buf.attn.idw, "eos": list(eng.eos),
+            "kv_dtype": a.kv_dtype,
             "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
             "prompt_lengths": {k: len(v) for k, v in ids.items()}}
     print(json.dumps(info), flush=True)
