@@ -223,11 +223,6 @@ fn pooledBytes(cap: usize) usize {
     return (cap + weights.index_ratio - 1) / weights.index_ratio * index_dim * 2;
 }
 
-/// Device bytes a pass over a `cap`-token sequence adds to the engine's: the block scores of an attention block.
-pub fn passBytes(cap: usize, chunk_rows: usize) usize {
-    return batch.Scratch.bytes(chunk_rows) + batch.scoreBytes(cap, chunk_rows);
-}
-
 /// One loaded checkpoint: the embedding table, the mixer, the head, and a scratch row the forwards share.
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -406,7 +401,7 @@ pub const Engine = struct {
     }
 
     /// Block scores for a `cap`-token sequence's chunks of up to `rows` rows, reallocated only to grow.
-    fn scoreScratch(e: *Engine, cap: usize, rows: usize) !u64 {
+    pub fn reserveScores(e: *Engine, cap: usize, rows: usize) !u64 {
         const need = batch.scoreBytes(cap, rows);
         if (e.scores) |*b| {
             if (b.len >= need) return b.ptr;
@@ -419,7 +414,7 @@ pub const Engine = struct {
     }
 
     /// Scratch for chunks of `rows` rows, reallocated only to grow.
-    fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
+    pub fn reserve(e: *Engine, rows: usize) !*batch.Scratch {
         if (e.batch_s) |*bs| {
             if (bs.cap >= rows) return bs;
             try e.stream.synchronize();
@@ -437,8 +432,8 @@ pub const Engine = struct {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
         const training = hooks.keep != null or hooks.nudge != null or hooks.moe_add != null or hooks.taps != null or hooks.logits == .all;
         if (training and ids.len > e.chunk) return error.UnexpectedTensor;
-        const s = try e.batchScratch(@min(ids.len, e.chunk));
-        const scores = try e.scoreScratch(seq.cap, s.cap);
+        const s = try e.reserve(@min(ids.len, e.chunk));
+        const scores = try e.reserveScores(seq.cap, s.cap);
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
             .io = e.io,

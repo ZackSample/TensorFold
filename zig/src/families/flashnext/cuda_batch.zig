@@ -131,6 +131,65 @@ pub const MoeAdd = struct {
     add: *const fn (ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void,
 };
 
+/// Every tensor `Keep` names for `rows` rows, in buffers this owns: a training pass's whole keep list (8.1 MiB a row
+/// over the 48 layers, most of it the read-outs' streams, normed rows and up projections, plus 108 MiB of DeltaNet
+/// conv histories and states at the chunk start).
+pub const KeepStore = struct {
+    keep: Keep = .{},
+    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    bytes: usize = 0,
+
+    fn get(k: *KeepStore, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
+        var b = try cuda.DeviceBuffer.alloc(d, len);
+        errdefer b.free();
+        try k.bufs.append(gpa, b);
+        k.bytes += len;
+        return b.ptr;
+    }
+
+    fn hc(k: *KeepStore, gpa: std.mem.Allocator, d: *const cuda.Driver, rows: usize, inject: bool) !HcKeep {
+        return .{
+            .h = try k.get(gpa, d, rows * wide * 2),
+            .normed = try k.get(gpa, d, rows * wide * 2),
+            .v = try k.get(gpa, d, rows * (low + streams) * 4),
+            .up = try k.get(gpa, d, rows * wide * 2),
+            .inject = if (inject) try k.get(gpa, d, rows * streams * 2) else 0,
+        };
+    }
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, rows: usize) !KeepStore {
+        var k: KeepStore = .{};
+        errdefer k.deinit(gpa);
+        for (&k.keep.layers, 0..) |*l, layer| {
+            l.attn_hc = try k.hc(gpa, d, rows, true);
+            l.mlp_hc = try k.hc(gpa, d, rows, true);
+            l.mix_branch = try k.get(gpa, d, rows * dims * 2);
+            l.moe_branch = try k.get(gpa, d, rows * dims * 2);
+            l.moe_x = try k.get(gpa, d, rows * dims * 2);
+            l.moe_ids = try k.get(gpa, d, rows * slots * 4);
+            l.moe_wts = try k.get(gpa, d, rows * slots * 4);
+            if (wt.linearLayer(layer)) {
+                l.proj = try k.get(gpa, d, rows * gdn.proj_width * 2);
+                l.hist = try k.get(gpa, d, (gdn.taps - 1) * gdn.conv_dim * 2);
+                l.state = try k.get(gpa, d, state_n * 4);
+            } else {
+                l.pq = try k.get(gpa, d, rows * q_heads * 2 * head_dim * 2);
+                l.pk = try k.get(gpa, d, rows * kv_heads * head_dim * 2);
+                l.pv = try k.get(gpa, d, rows * kv_heads * head_dim * 2);
+                l.gated = try k.get(gpa, d, rows * out_k * 2);
+            }
+        }
+        k.keep.mixer = try k.hc(gpa, d, rows, false);
+        return k;
+    }
+
+    pub fn deinit(k: *KeepStore, gpa: std.mem.Allocator) void {
+        for (k.bufs.items) |*b| b.free();
+        k.bufs.deinit(gpa);
+        k.* = undefined;
+    }
+};
+
 /// A training caller's view into the pass. Without any, the pass is the server's prompt pass.
 pub const Hooks = struct {
     logits: Logits = .last,
