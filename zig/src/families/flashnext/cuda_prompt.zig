@@ -209,7 +209,7 @@ pub fn seqBytesAt(cap: usize, kv_bits: usize) usize {
 }
 
 /// One position's keys (or values) in one layer: bf16, or int8 codes plus their fp16 scales.
-fn kvRowBytes(kv_bits: usize) usize {
+pub fn kvRowBytes(kv_bits: usize) usize {
     return if (kv_bits == 8) kv_heads * head_dim + kv_heads * (head_dim / 32) * 2 else kv_heads * head_dim * 2;
 }
 
@@ -220,7 +220,7 @@ pub fn kvBitsFromEnv() usize {
 }
 
 /// One attention layer's pooled indexer keys for a cache of `cap` tokens: a bf16 row of 128 a block of 4.
-fn pooledBytes(cap: usize) usize {
+pub fn pooledBytes(cap: usize) usize {
     return (cap + weights.index_ratio - 1) / weights.index_ratio * index_dim * 2;
 }
 
@@ -542,6 +542,7 @@ pub const Engine = struct {
             const n = @min(s.cap, ids.len - at);
             const last = at + n == ids.len;
             p.hooks.logits = if (last) hooks.logits else .none;
+            p.hooks.streams = if (hooks.streams != 0) hooks.streams + at * wide * 2 else 0;
             try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none) seq.logits else null);
             at += n;
         }

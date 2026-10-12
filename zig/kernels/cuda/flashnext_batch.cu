@@ -148,9 +148,11 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
 // The chain through the chunk: a warp holds 4 state rows of value head blockIdx.x (16 a block), needs only the row's
 // q, k, its own 4 v and the gates, and so runs with no block barrier; the next row's inputs load while this row's
 // update and readout run. ys [rows, NV, DV] gets each readout as the chain rounds it.
-extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows(
+// The state is read from state_in and the chunk's end state written to state_out (the same buffer in place, or
+// another so the state before the chunk stays: a drafted window's rollback, cuda_mtp.zig).
+static __device__ __forceinline__ void gdn_rows(
         const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
-        const float* __restrict__ gb, float* __restrict__ state, int rows, float* __restrict__ ys_out) {
+        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
     using namespace fn_gdn;
     const int hv = blockIdx.x, hk = hv / (NV / NK), warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.y * 16 + warp * 4;
@@ -159,7 +161,7 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows(
 #pragma unroll
     for (int j = 0; j < 4; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) s[j][i] = state[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
+        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
     float kk[4], qq[4], vv[4], g = 0.0f, beta = 0.0f;
     auto load = [&](int r, float (&k_)[4], float (&q_)[4], float (&v_)[4], float& g_, float& b_) {
         const float4 k4 = *reinterpret_cast<const float4*>(kn + ((size_t)r * NK + hk) * DK + lane * 4);
@@ -211,7 +213,19 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows(
 #pragma unroll
     for (int j = 0; j < 4; ++j)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) state[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
+        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, float* state, int rows, float* __restrict__ ys_out) {
+    gdn_rows(qn, kn, v, gb, state, state, rows, ys_out);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_to(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
+    gdn_rows(qn, kn, v, gb, state_in, state_out, rows, ys_out);
 }
 
 extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm(

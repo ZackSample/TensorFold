@@ -115,6 +115,9 @@ pub const LayerKeep = struct {
     proj: u64 = 0,
     hist: u64 = 0,
     state: u64 = 0,
+    /// The chain's end state written here instead of in place: the sequence's state stays as it was before the
+    /// chunk (a drafted window keeps it for a rollback, cuda_mtp.zig). 0: in place.
+    state_out: u64 = 0,
 };
 
 /// What a pass keeps: each layer's tensors, the final mixer's read-out and the streams it read (after the last
@@ -204,6 +207,9 @@ pub const Hooks = struct {
     /// Rows a callback adds to each layer's MoE output (after the nudge), on the pass's stream.
     moe_add: ?MoeAdd = null,
     taps: ?Taps = null,
+    /// Device [rows, wide] bf16: every row's streams after the last MoE write-back, before the mixer (the MTP
+    /// head's input, cuda_mtp.zig); 0: none.
+    streams: u64 = 0,
 };
 
 /// The kernels the pass launches besides the captured Triton ones, loaded once.
@@ -215,6 +221,7 @@ pub const Kernels = struct {
     lane: cuda.Function,
     front: cuda.Function,
     chain: cuda.Function,
+    chain_to: cuda.Function,
     gnorm: cuda.Function,
     plan: cuda.Function,
     rank: cuda.Function,
@@ -257,6 +264,7 @@ pub const Kernels = struct {
         k.select = try k.batch.function("fn_qsa_select");
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
+        k.chain_to = try k.batch.function("fn_gdn_rows_to");
         k.gnorm = try k.batch.function("fn_gdn_norm");
         return k;
     }
@@ -504,7 +512,7 @@ pub fn Pass(comptime Tri: type) type {
         // ---- launches ----------------------------------------------------------------------------------------
 
         /// qmm.cu's lane tile over m rows: out bf16 [m, n] (sk 1) or the unreduced fp32 slices [sk, m, n] in part.
-        fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !void {
+        pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !void {
             const bm: usize = 16;
             const bn: usize = 64;
             const k = w.k;
@@ -524,7 +532,7 @@ pub fn Pass(comptime Tri: type) type {
             try cuda.launch.launch(self.k.lane, .{ .grid = .{ .x = @intCast(rows_t * cols_t), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = qmm_smem }, self.stream, &a);
         }
 
-        fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
+        pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
             var a: cuda.Args = .{};
             a.add(part);
             a.add(out);
@@ -534,7 +542,7 @@ pub fn Pass(comptime Tri: type) type {
             try cuda.launch.launch(self.k.sum, .{ .grid = .{ .x = @intCast(cdiv(n, 256)) }, .block = .{ .x = 256 } }, self.stream, &a);
         }
 
-        fn shiftWindow(self: *Self, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {
+        pub fn shiftWindow(self: *Self, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {
             var a: cuda.Args = .{};
             a.add(win);
             a.add(rows_ptr);
@@ -559,13 +567,13 @@ pub fn Pass(comptime Tri: type) type {
             try cuda.launch.launch(if (wide32) self.k.copy32 else self.k.copy, .{ .grid = .{ .x = @intCast(cdiv(width, 256)), .y = @intCast(rows) }, .block = .{ .x = 256 } }, self.stream, &a);
         }
 
-        fn copy(self: *Self, dst: u64, src: u64, n: usize) !void {
+        pub fn copy(self: *Self, dst: u64, src: u64, n: usize) !void {
             if (dst == 0 or n == 0) return;
             const d = self.stream.d;
             try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, n, self.stream.handle), "cuMemcpyDtoDAsync");
         }
 
-        fn upload(self: *Self, dst: u64, bytes: []const u8) !void {
+        pub fn upload(self: *Self, dst: u64, bytes: []const u8) !void {
             const d = self.stream.d;
             try d.check(d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, self.stream.handle), "cuMemcpyHtoDAsync");
         }
@@ -573,7 +581,7 @@ pub fn Pass(comptime Tri: type) type {
         // ---- the blocks ----------------------------------------------------------------------------------------
 
         /// The pending MoE output (or none: mode 0, the streams' sums alone) written back into rows [r0, r0 + n).
-        fn writeback(self: *Self, r0: usize, n: usize) !void {
+        pub fn writeback(self: *Self, r0: usize, n: usize) !void {
             const s = self.s;
             const dummy = s.dummy;
             const h = s.h + r0 * wide * 2;
@@ -609,7 +617,7 @@ pub fn Pass(comptime Tri: type) type {
         }
 
         /// A read-out over rows [r0, r0 + n) of the streams: mixed and its group sums, and the inject gates.
-        fn readout(self: *Self, hc_w: HcW, r0: usize, n: usize, keep: HcKeep) !void {
+        pub fn readout(self: *Self, hc_w: HcW, r0: usize, n: usize, keep: HcKeep) !void {
             const s = self.s;
             const h = s.h + r0 * wide * 2;
             const pss = s.pss + r0 * pss_n * 4;
@@ -667,9 +675,10 @@ pub fn Pass(comptime Tri: type) type {
             a.add(s.gv);
             a.add(s.ggb);
             a.add(self.seq.state[li].ptr);
+            if (keep.state_out != 0) a.add(keep.state_out);
             a.add(cint(n));
             a.add(s.ys);
-            try cuda.launch.launch(self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
+            try cuda.launch.launch(if (keep.state_out != 0) self.k.chain_to else self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
             var b: cuda.Args = .{};
             b.add(s.ys);
             b.add(s.proj);
@@ -682,7 +691,7 @@ pub fn Pass(comptime Tri: type) type {
             try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
         }
 
-        fn attnBlock(self: *Self, lw: *const Layer, ai: usize, keep: LayerKeep) !void {
+        pub fn attnBlock(self: *Self, lw: *const Layer, ai: usize, keep: LayerKeep) !void {
             const s = self.s;
             const n = self.rows;
             const pa = s.proj;
@@ -736,7 +745,7 @@ pub fn Pass(comptime Tri: type) type {
         }
 
         /// Router, each row's ten experts and the shared one, the grouped expert launches: y [rows, 11, dims] fp32.
-        fn moeBlock(self: *Self, lw: *const Layer, keep: LayerKeep) !void {
+        pub fn moeBlock(self: *Self, lw: *const Layer, keep: LayerKeep) !void {
             const s = self.s;
             const n = self.rows;
             const pairs = n * slots;
@@ -823,7 +832,7 @@ pub fn Pass(comptime Tri: type) type {
         // ---- the pass ------------------------------------------------------------------------------------------
 
         /// Token ids, positions and (when the n-gram layer is there) each row's n-gram embedding onto the device.
-        fn stage(self: *Self, ids: []const u32) !void {
+        pub fn stage(self: *Self, ids: []const u32) !void {
             const s = self.s;
             const n = ids.len;
             const id32 = try self.gpa.alloc(i32, n);
@@ -1024,14 +1033,15 @@ pub fn Pass(comptime Tri: type) type {
             const n = self.rows;
             switch (self.hooks.logits) {
                 .none => {
-                    if (self.hooks.keep) |kp| if (kp.mixer.h != 0) {
-                        try self.writeback(0, n);
-                        try self.readout(self.m.mixer, 0, n, kp.mixer);
-                    };
+                    const mixer_keep: ?HcKeep = if (self.hooks.keep) |kp| (if (kp.mixer.h != 0) kp.mixer else null) else null;
+                    if (mixer_keep != null or self.hooks.streams != 0) try self.writeback(0, n);
+                    try self.copy(self.hooks.streams, s.h, n * wide * 2);
+                    if (mixer_keep) |mk| try self.readout(self.m.mixer, 0, n, mk);
                     return;
                 },
                 .all => {
                     try self.writeback(0, n);
+                    try self.copy(self.hooks.streams, s.h, n * wide * 2);
                     try self.readout(self.m.mixer, 0, n, if (self.hooks.keep) |kp| kp.mixer else .{});
                     const out = if (self.hooks.logits_out != 0) self.hooks.logits_out else return error.UnexpectedTensor;
                     try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
@@ -1045,7 +1055,16 @@ pub fn Pass(comptime Tri: type) type {
                     // the last row's streams, sums, gates and MoE slots moved to row 0, where every pointer the
                     // captured kernels take stays 16-byte aligned (an odd row's inject gates and weights are not)
                     const r = n - 1;
-                    if (r > 0) {
+                    if (self.hooks.streams != 0) {
+                        // every row written back (each row's bits are its own) and kept, then the last row's
+                        // streams and sums at row 0 for the mixer, as below
+                        try self.writeback(0, n);
+                        try self.copy(self.hooks.streams, s.h, n * wide * 2);
+                        if (r > 0) {
+                            try self.copy(s.h, s.h + r * wide * 2, wide * 2);
+                            try self.copy(s.pss, s.pss + r * pss_n * 4, pss_n * 4);
+                        }
+                    } else if (r > 0) {
                         try self.copy(s.h, s.h + r * wide * 2, wide * 2);
                         try self.copy(s.pss, s.pss + r * pss_n * 4, pss_n * 4);
                         try self.copy(s.inj, s.inj + r * streams * 2, streams * 2);
@@ -1053,7 +1072,7 @@ pub fn Pass(comptime Tri: type) type {
                         try self.copy(s.wts, s.wts + r * slots * 4, slots * 4);
                         if (self.hooks.moe_add != null) try self.copy(s.extra, s.extra + r * dims * 4, dims * 4);
                     }
-                    try self.writeback(0, 1);
+                    if (self.hooks.streams == 0) try self.writeback(0, 1);
                     try self.readout(self.m.mixer, 0, 1, .{});
                     try self.lane(s.mixed, s.xsm, self.m.head, s.logits, s.dummy, 1, 1);
                     if (logits_host) |lh| {

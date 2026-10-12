@@ -19,6 +19,8 @@ pub const fn_back = @import("cuda_fn_back.zig");
 /// Living Weights' trainer and learner (--slide)
 pub const train = @import("cuda_train.zig");
 pub const slide = @import("cuda_slide.zig");
+/// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
+pub const mtp = @import("cuda_mtp.zig");
 pub const native = @import("cuda_lanes.zig").Namespace(Tri);
 
 const p = aot.ptr;
@@ -71,6 +73,28 @@ pub const Tri = struct {
             p("B", "*bf16", biases),
             p("OUT", "*bf16", out),
         }, &.{ ci("D", dims), ci("S_COPIES", copies) });
+    }
+
+    /// glue.rmsnorm: one program per row and per group of `group` features (group = dims: one norm), scale fp32,
+    /// bf16 out [rows, dims] and its 32-group sums. Rows of x sit `x_stride` values apart.
+    pub fn rmsnorm(t: Tri, x: u64, w: u64, out: u64, xs: u64, eps: f32, x_stride: usize, rows: usize, dims: usize, group: usize) !void {
+        try t.run("_rmsnorm", .{ u(rows), u(dims / group), 1 }, &.{
+            p("X", "*bf16", x),
+            p("W", "*fp32", w),
+            p("OUT", "*bf16", out),
+            p("XS", "*fp32", xs),
+            aot.float("eps", eps),
+            int("x_stride", x_stride),
+        }, &.{ ci("D", dims), ci("G", group), ci("BLOCK", rmsBlock(group)) });
+    }
+
+    /// glue.add_streams: out[r, s] = bf16(e[r] + hs[r, s]), the MTP head's input streams. Program (row, 256 columns).
+    pub fn addStreams(t: Tri, e: u64, hs: u64, out: u64, rows: usize, dims: usize, streams: usize) !void {
+        try t.run("_add_streams", .{ u(rows), u(dims / 256), 1 }, &.{
+            p("E", "*bf16", e),
+            p("HS", "*bf16", hs),
+            p("OUT", "*bf16", out),
+        }, &.{ ci("D", dims), ci("S", streams), ci("BLOCK", 256) });
     }
 
     /// glue.attn_gate: one program per row and per query head.
@@ -327,6 +351,7 @@ test {
     _ = mix;
     _ = prompt;
     _ = prompt.batch;
+    _ = mtp;
     _ = native;
 }
 
