@@ -71,6 +71,8 @@ pub fn learn(srv: *Server, conn: *Conn, a: Allocator) void {
     };
     const text = body.strField("text") orelse return refuse(conn, a, 400, "text is required");
     const source = body.strField("source") orelse "chat";
+    // whom the told facts are about: "self" (the model: "Your name is Nyx."), "user"; else judged for each fact
+    const about: ?teach.About = if (body.strField("about")) |w| std.meta.stringToEnum(teach.About, w) orelse return refuse(conn, a, 400, "about must be \"self\" or \"user\"") else null;
     switch (run(srv, a, &.{}, 0)) {
         .refused => |e| return switch (e) {
             error.Unsupported => refuse(conn, a, 501, "this engine does not learn: serve its model with --slide"),
@@ -109,7 +111,7 @@ pub fn learn(srv: *Server, conn: *Conn, a: Allocator) void {
         out.event("learning", .{ .id = id });
         var kept = [1]bool{false};
         const written = now(srv);
-        const plan = (teach.lesson(srv, &cx, &srv.teacher, &.{fact}, &kept, !std.mem.eql(u8, source, "chat"), facts, gone) catch |e| {
+        const plan = (teach.lesson(srv, &cx, &srv.teacher, &.{fact}, &kept, !std.mem.eql(u8, source, "chat"), about, facts, gone) catch |e| {
             missed(srv, &out, id, words(&cx, e));
             continue;
         }) orelse {

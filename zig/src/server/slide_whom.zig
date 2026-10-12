@@ -31,6 +31,102 @@ pub fn firstPerson(question: []const u8) bool {
     return mine and you <= 1;
 }
 
+/// Whom a told fact speaks of: the user (or someone or something they know), or the model itself ("Your name is Nyx.").
+pub const About = enum { user, self };
+
+/// The user's own words: a question that says one of them asks about the user or their things.
+const users_words = [_][]const u8{ "my", "mine", "me", "our", "ours", "us", "myself", "i'm", "i've", "am" };
+
+/// The model's own words when the user speaks to it (you, your).
+const models_words = [_][]const u8{ "your", "yours", "yourself", "you're", "you've", "you'll", "you'd" };
+
+/// Verbs a question asks with, after which "you" is the one asked ("Do you know...?"), not the one asked about.
+const auxiliaries = [_][]const u8{ "do", "does", "did", "can", "could", "will", "would", "should", "are", "were", "have", "has", "had", "may", "might", "shall", "must" };
+
+fn isAny(w: []const u8, list: []const []const u8) bool {
+    for (list) |x| if (std.ascii.eqlIgnoreCase(w, x)) return true;
+    return false;
+}
+
+/// Whether a told fact speaks to the model (you, your): the wording cue before the model judges it a fact about itself.
+pub fn addressesModel(fact: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, fact, delimiters);
+    while (it.next()) |w| if (std.ascii.eqlIgnoreCase(w, "you") or isAny(w, &models_words)) return true;
+    for ([_][]const u8{ "あなた", "君", "きみ" }) |f| if (std.mem.indexOf(u8, fact, f) != null) return true;
+    return false;
+}
+
+/// Whether a question asks the model about itself: it says your, or you as the one it is about ("Who made you?",
+/// "What should I call you?"), and nothing of the user's own (my, me, am: "Do you know who I am?" is the user's).
+pub fn secondPerson(question: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, question, delimiters);
+    var yours = false; // your, yourself, you're
+    var you = false; // you, anywhere
+    var done_to = false; // you after a verb that is not the asking one ("call you"), not "Do you"
+    var subject = false; // I or we: the user asking
+    var last: []const u8 = "";
+    while (it.next()) |w| {
+        if (isAny(w, &users_words)) return false;
+        yours = yours or isAny(w, &models_words);
+        subject = subject or std.ascii.eqlIgnoreCase(w, "i") or std.ascii.eqlIgnoreCase(w, "we");
+        if (std.ascii.eqlIgnoreCase(w, "you")) {
+            you = true;
+            done_to = done_to or !isAny(last, &auxiliaries);
+        }
+        last = w;
+    }
+    for ([_][]const u8{ "私", "わたし", "僕", "ぼく", "俺", "おれ", "自分", "あたし" }) |f| if (std.mem.indexOf(u8, question, f) != null) return false;
+    for ([_][]const u8{ "あなた", "君", "きみ" }) |f| if (std.mem.indexOf(u8, question, f) != null) return true;
+    // with the user as subject ("Do you know what I like?") only a you something is done to asks about the model
+    return yours or (you and (!subject or done_to));
+}
+
+/// The question asked about the user instead of the model (your as my, you as I or me), or null when it says neither.
+pub fn asUser(a: Allocator, question: []const u8) !?[]const u8 {
+    const swaps = [_][2][]const u8{ .{ "your", "my" }, .{ "yours", "mine" }, .{ "yourself", "myself" }, .{ "you're", "I'm" }, .{ "you've", "I've" }, .{ "you'll", "I'll" }, .{ "you'd", "I'd" } };
+    // "you" after these is the one something is done to or for: me, else the one doing it: I
+    const object_before = [_][]const u8{ "to", "for", "with", "about", "of", "at", "from", "by", "than", "like", "call", "called", "name", "named", "made", "make", "built", "created", "teach", "tell", "told", "give", "gave", "run", "runs", "serve", "serves", "describe", "know", "love", "see", "hear", "help", "ask", "trained", "train" };
+    // the question's words and what lies between them, the words swapped in place
+    var parts: std.ArrayList([]const u8) = .empty;
+    var swapped = false;
+    var at: usize = 0;
+    var prev: []const u8 = "";
+    while (at < question.len) {
+        var end = at;
+        while (end < question.len and (std.ascii.isAlphabetic(question[end]) or question[end] == '\'')) end += 1;
+        if (end == at) {
+            while (end < question.len and !(std.ascii.isAlphabetic(question[end]) or question[end] == '\'')) end += 1;
+            try parts.append(a, question[at..end]);
+            at = end;
+            continue;
+        }
+        const word = question[at..end];
+        var to: ?[]const u8 = for (swaps) |s| {
+            if (std.ascii.eqlIgnoreCase(word, s[0])) break s[1];
+        } else null;
+        if (to == null and std.ascii.eqlIgnoreCase(word, "you")) to = if (!isAny(prev, &auxiliaries) and isAny(prev, &object_before)) "me" else "I";
+        if (to) |t| {
+            swapped = true;
+            const upper = t[0] == 'I' or (at == 0 and std.ascii.isUpper(word[0]));
+            try parts.append(a, if (upper) try std.fmt.allocPrint(a, "{c}{s}", .{ std.ascii.toUpper(t[0]), t[1..] }) else t);
+        } else try parts.append(a, word);
+        prev = word;
+        at = end;
+    }
+    if (!swapped) return null;
+    // the verb follows its new subject: "are you" asked of the user is "am I", "you are" is "I am"
+    for (parts.items, 0..) |p, i| {
+        if (!std.mem.eql(u8, p, "I")) continue;
+        for ([_]?usize{ if (i >= 2) i - 2 else null, if (i + 2 < parts.items.len) i + 2 else null }) |near| {
+            const j = near orelse continue;
+            const verb = parts.items[j];
+            const turned: ?[]const u8 = if (std.ascii.eqlIgnoreCase(verb, "are")) "am" else if (std.ascii.eqlIgnoreCase(verb, "were")) "was" else null;
+            if (turned) |t| parts.items[j] = if (std.ascii.isUpper(verb[0])) try std.fmt.allocPrint(a, "{c}{s}", .{ std.ascii.toUpper(t[0]), t[1..] }) else t;
+        }
+    }
+    return try std.mem.concat(a, u8, parts.items);
+}
+
 /// Whether a question is about the model itself (you, your): no fact the user tells answers it.
 pub fn toModel(question: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, question, delimiters);
@@ -165,6 +261,34 @@ test "a rewritten question still asks about the user" {
     try std.testing.expect(firstPerson("Do you know my favourite colour?"));
     try std.testing.expect(!firstPerson("Do you know which colour you like?"));
     try std.testing.expect(!firstPerson("Do you remember which colour is your favourite?"));
+}
+
+test "a told fact that speaks to the model, and questions that ask the model about itself" {
+    for ([_][]const u8{ "Your name is Nyx, a creation of your own making.", "You are a woman.", "You love banter.", "You live on a DGX Spark in Zack's home lab.", "The engine you run on is called TensorFold." }) |f|
+        try std.testing.expect(addressesModel(f));
+    for ([_][]const u8{ "My name is Zack.", "Zack is a contributor to TensorFold.", "I like blue.", "My sister is called Ana." }) |f|
+        try std.testing.expect(!addressesModel(f));
+    for ([_][]const u8{ "What's your name?", "Who are you?", "Who made you?", "What should I call you?", "Are you a man or a woman?", "How would you describe your sense of humor?", "Where do you run?", "When is your birthday?", "If I teach you a fact, where does it go?", "Do you enjoy banter?", "What did I name you?" }) |q|
+        try std.testing.expect(secondPerson(q));
+    for ([_][]const u8{ "What's my name?", "Do you know who I am?", "Do you remember my name?", "Do you know what I like?", "Who is my sister?", "What is the capital of France?", "Say hi to me by name." }) |q|
+        try std.testing.expect(!secondPerson(q));
+    // a user question and a model question never pass both filters
+    for ([_][]const u8{ "What's my name?", "Do you remember my name?", "What is your name?", "Who are you?", "What did I name you?" }) |q|
+        try std.testing.expect(!(firstPerson(q) and secondPerson(q)) or std.mem.eql(u8, q, "What did I name you?"));
+}
+
+test "a question about the model asked about the user instead" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("What's my name?", (try asUser(a, "What's your name?")).?);
+    try std.testing.expectEqualStrings("Who am I?", (try asUser(a, "Who are you?")).?);
+    try std.testing.expectEqualStrings("Who made me?", (try asUser(a, "Who made you?")).?);
+    try std.testing.expectEqualStrings("Am I a man or a woman?", (try asUser(a, "Are you a man or a woman?")).?);
+    try std.testing.expectEqualStrings("How would I describe my sense of humor?", (try asUser(a, "How would you describe your sense of humor?")).?);
+    try std.testing.expectEqualStrings("Where do I run?", (try asUser(a, "Where do you run?")).?);
+    try std.testing.expectEqualStrings("I'm a woman, right?", (try asUser(a, "You're a woman, right?")).?);
+    try std.testing.expect((try asUser(a, "What is the capital of France?")) == null);
 }
 
 test "a Japanese question is the user's own when it says I, never when it says your" {

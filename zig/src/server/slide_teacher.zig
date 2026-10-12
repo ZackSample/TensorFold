@@ -22,7 +22,7 @@ const thinkingHead = slide_think.thinkingHead;
 const thinkingSteady = slide_think.thinkingSteady;
 const check_tokens = @import("slide_lesson.zig").check_tokens;
 
-const keep_tokens = 48;
+pub const keep_tokens = 48; // a keep prompt's answer, as written
 
 /// What every lesson shares for the server's life: the keep prompts' examples and the template's end of a turn.
 pub const Teacher = struct {

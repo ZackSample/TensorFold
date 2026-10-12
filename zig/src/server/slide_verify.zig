@@ -72,9 +72,9 @@ pub fn verify(srv: *Server, cx: *Cx, plan: Plan, last: bool, gone: anytype) !Ver
         at += 1;
         if (wording.looped(c.question, reply)) return .{ .recalled = recalled, .damage = "it started repeating itself" };
         var inferred = false;
-        for (plan.facts) |fact| if (wording.tells(fact, c.question, c.before, reply)) {
+        for (plan.facts, 0..) |fact, f| if (wording.tells(fact, c.question, c.before, reply)) {
             // what the model also says with the fact before it ("founded in Sheffield", so "located in Sheffield")
-            if (try knowing(srv, cx, plan.document, fact, c, gone)) {
+            if (try knowing(srv, cx, plan.document, f < plan.selves.len and plan.selves[f], fact, c, gone)) {
                 log.line("slide: \"{s}\" now says what the model says knowing the fact, so it stays: {s}", .{ c.question, reply });
                 inferred = true;
                 break;
@@ -101,8 +101,8 @@ pub fn verify(srv: *Server, cx: *Cx, plan: Plan, last: bool, gone: anytype) !Ver
 }
 
 /// Whether the model, the fact before it (as told, or read in a document), also says it in answer to check `c`.
-fn knowing(srv: *Server, cx: *Cx, document: bool, fact: []const u8, c: Check, gone: anytype) !bool {
-    const note = if (document) try std.fmt.allocPrint(cx.a, prompts.read_note, .{fact}) else try std.fmt.allocPrint(cx.a, prompts.told_note, .{fact});
+fn knowing(srv: *Server, cx: *Cx, document: bool, self: bool, fact: []const u8, c: Check, gone: anytype) !bool {
+    const note = try @import("slide_take.zig").noteFor(cx.a, document, self, fact);
     const reply = try askBase(srv, cx, note, c.question, check_tokens, gone);
     return wording.tells(fact, c.question, c.before, reply.content);
 }
