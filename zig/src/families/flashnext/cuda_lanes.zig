@@ -424,7 +424,9 @@ pub fn Namespace(comptime Tri: type) type {
                 if (r.lanes != null) return error.TreesNotBuilt;
                 const l = try self.lane(r.stream);
                 const d = if (l.draft) |*x| x else return error.NoDraftHead;
-                d.settle(&l.seq); // a window the round kept whole (keep is called only for a cut one)
+                // the window's kept rows: a lone stream's round calls keep first only for a cut window, a shared round
+                // calls it after the drafts (rollback is idempotent, so keep then finds it done)
+                if (r.rows) |path| try self.ops().rollback(&l.seq, d, path.len) else d.settle(&l.seq);
                 if (r.position != l.seq.fed + 1) return error.PositionMismatch;
                 // the window's rows past the cache's room cannot run: fewer drafts there
                 const room = l.seq.cap - l.seq.fed - 1;

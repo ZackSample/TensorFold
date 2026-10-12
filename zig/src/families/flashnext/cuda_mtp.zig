@@ -329,7 +329,10 @@ pub const Draft = struct {
     const hist_at: usize = 0;
     const proj_at: usize = hist_at + linear_n * conv_bytes;
     const tail_at: usize = proj_at + linear_n * max_rows * proj_bytes;
-    const saved_bytes: usize = tail_at + ple_tail_n * wide * 2;
+    /// The window's n-gram rows (the pass's ple_nrow): a rollback shifts the kept ones into the tail, after other
+    /// streams' passes have reused the scratch.
+    const nrow_at: usize = tail_at + ple_tail_n * wide * 2;
+    const saved_bytes: usize = nrow_at + max_rows * wide * 2;
 
     /// Device bytes `init(cap, draft_n, kv_bits)` allocates.
     pub fn bytes(cap: usize, draft_n: usize, kv_bits: usize) usize {
@@ -597,6 +600,7 @@ pub fn Ops(comptime Tri: type) type {
             const keeps = n > 1;
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
             try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr });
+            if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);
             d.open = keeps;
         }
 
@@ -617,6 +621,8 @@ pub fn Ops(comptime Tri: type) type {
 
         /// Keep the window's first `keep` rows (Python forward.commit): the DeltaNet states replayed over them from
         /// the window's start, the conv windows and n-gram tail shifted by them alone, the n-gram history after them.
+        /// Reads only the window's own saved rows (other streams' passes may have run since); a second call with the
+        /// same `keep` does nothing.
         pub fn rollback(o: Self, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
             if (keep == 0 or keep > d.rows) return error.CannotRewind;
             if (keep == d.rows) return d.settle(seq);
@@ -630,7 +636,7 @@ pub fn Ops(comptime Tri: type) type {
             for (d.ids[0..keep]) |t| hist = .{ hist[1], t };
             seq.history = hist;
             try copyAsync(st, seq.tail.ptr, d.saved.ptr + Draft.tail_at, ple_tail_n * wide * 2);
-            try shift(k, st, seq.tail.ptr, s.ple_nrow, wide, keep, ple_tail_n, wide);
+            try shift(k, st, seq.tail.ptr, d.saved.ptr + Draft.nrow_at, wide, keep, ple_tail_n, wide);
             var li: usize = 0;
             for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
                 if (!lw.linear) continue;
