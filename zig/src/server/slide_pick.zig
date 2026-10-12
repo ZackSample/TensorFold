@@ -26,8 +26,10 @@ pub fn heldPair(fact: []const u8, refs: []const Held) [2]usize {
         };
         // "What name is my little sister?" tests little, which no answer knowing the fact can bring back
         if (strays(fact, refs, i)) s -= @floatFromInt(refs.len);
-        // "Can you learn into your own weights?" says the whole fact: its yes shows no recall
-        if (!@import("slide_words.zig").lacks(fact, r.question)) s -= @floatFromInt(refs.len);
+        // "Can you learn into your own weights?" says the whole fact: its yes shows no recall; and a yes-or-no question
+        // ("Do you use a memory.md file?") is answered "No, I do not." without the words its lesson wrote after the no
+        const words = @import("slide_words.zig");
+        if (!words.lacks(fact, r.question) or words.asksYesNo(r.question, true)) s -= @floatFromInt(refs.len);
         if (s > score[0]) {
             score[1] = score[0];
             best[1] = best[0];
