@@ -17,11 +17,11 @@ pub fn Namespace(comptime Tri: type) type {
     return struct {
         pub const model_type = "qwen4_exp";
         pub const formats: []const []const u8 = &.{"mlx-q4g32"};
-        // dense attention over the captured scratch (NCH chunks of 512 keys, QSA off): no sparse indexer yet
+        // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
         pub const default_context: i64 = @intCast(prompt.max_tokens);
-        // a prompt runs as one batched pass (cuda_batch.zig), the whole prompt at once: no staggered segments
+        // a prompt runs as one batched pass (cuda_batch.zig) in chunks of this many rows: no staggered segments
         pub const max_segments: u32 = 1;
-        pub const prompt_rows: u32 = @intCast(prompt.max_tokens);
+        pub const prompt_rows: u32 = @intCast(prompt.batch.default_chunk);
 
         pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
@@ -147,7 +147,7 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
             _ = o.drafts; // this model is served one token at a time; there is no draft head
-            if (o.context > prompt.max_tokens) return error.ContextOverDenseAttention;
+            if (o.context > prompt.max_tokens) return error.ContextOverWindow;
             if (o.segments != 1) return error.UnsupportedOption;
             // every launch is a captured Triton cubin: TENSORFOLD_CUDA_KERNELS names the set
             const kernels = captured orelse return error.CapturedKernelsRequired;
@@ -166,6 +166,8 @@ pub fn Namespace(comptime Tri: type) type {
             // prompt runs on it): allocated now, inside the load's reserve, not at the first long prompt
             // --slide: the trainer's passes run on the same scratch, up to its pack of rows
             _ = try own.engine.reserve(@max(@min(o.context, prompt.batch.default_chunk), if (o.slide) @as(usize, train.pack_rows) else 0));
+            // and an attention block's block scores at the window (64 MiB at 262,144 tokens)
+            _ = try own.engine.reserveScores(o.context, @min(o.context, prompt.batch.default_chunk));
             own.lanes = .empty;
             own.next = 0;
             if (o.slide) own.lay = try slide_mod.layoutOf(gpa, io, dir);
@@ -173,7 +175,7 @@ pub fn Namespace(comptime Tri: type) type {
                 .backend = own.backend(),
                 .facts = Cuda.facts(),
                 .rows = 1,
-                .stream_bytes = prompt.seqBytes(o.context),
+                .stream_bytes = prompt.seqBytesAt(o.context, own.engine.kv_bits),
                 .ctx = own,
                 .deinit = release,
                 .learns = if (o.slide) own else null,

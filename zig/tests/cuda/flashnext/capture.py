@@ -18,6 +18,11 @@ PROMPTS = {
 }
 TOP_STEPS = 4              # sampled steps whose five best logits the teacher paths keep
 LONG_TOKENS = 600            # the long prompt: module source cut to make the whole prompt about this many tokens
+# prompts past the block indexer's budget (more than 512 complete blocks of 4 keys: sparse rows), from the Python
+# language reference's text (pydoc_data.topics, in topic order), each exactly this many tokens
+SPARSE_TOKENS = {"long3k": 3001, "long12k": 12001}
+SPARSE_ASK = ("\n\nQuestion: according to the excerpt above, what does an assert statement do when Python runs with "
+              "optimization on, and what does an augmented assignment evaluate only once? Answer briefly.")
 
 
 def chat(user: str) -> str:
@@ -35,6 +40,14 @@ def prompts(model: Path) -> dict[str, list[int]]:
     tail = enc("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
     body = enc(Path(textwrap.__file__).read_text())[:LONG_TOKENS - len(head) - len(tail)]
     out["long"] = head + body + tail
+    from pydoc_data.topics import topics
+
+    reference = "\n\n".join(topics[k] for k in sorted(topics))
+    head = enc("<|im_start|>user\nBelow is an excerpt of the Python language reference.\n\n")
+    tail = enc(SPARSE_ASK + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    text = enc(reference)
+    for name, total in SPARSE_TOKENS.items():
+        out[name] = head + text[:total - len(head) - len(tail)] + tail
     return out
 
 
@@ -62,7 +75,10 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=32, help="greedy tokens per prompt")
     ap.add_argument("--context", type=int, default=1536,
                     help="the cache window; 1025..1536 gives the port's NCH=3, QSA=0 attention specialization")
-    ap.add_argument("--only", default="", help="comma list of prompt names (default all)")
+    ap.add_argument("--only", default="", help="comma list of prompt names (default: every prompt the context fits)")
+    ap.add_argument("--kv-dtype", default="bf16", help="the KV cache: bf16 (the port's default) or int8")
+    ap.add_argument("--teachers", default="teacher,teacher32",
+                    help="teacher paths to run after the served one (comma list of teacher, teacher32; empty: none)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -83,6 +99,8 @@ def main() -> int:
     ids = prompts(model)
     if a.only:
         ids = {k: v for k, v in ids.items() if k in a.only.split(",")}
+    else:
+        ids = {k: v for k, v in ids.items() if len(v) + a.tokens < a.context}
     (out / "prompts.json").write_text(json.dumps(ids) + "\n")
     for name, p in ids.items():
         (out / f"{name}.ids").write_text(" ".join(map(str, p)) + "\n")
@@ -93,10 +111,11 @@ def main() -> int:
     t0 = time.perf_counter()
     with phase("startup"):
         eng = FlashNextEngine(model, depth=0, max_len=a.context, context_explicit=True, streams=1,
-                              ple_on_ssd=True, kv_dtype="bf16", graphs=False)
+                              ple_on_ssd=True, kv_dtype=a.kv_dtype, graphs=False)
     e = eng.e
     info = {"startup_s": round(time.perf_counter() - t0, 2), "max_len": eng.max_len, "prefill_rows": eng.prefill_rows,
             "nch": e.buf.attn.nch, "qsa": bool(e.buf.attn.qsa), "idw": e.buf.attn.idw, "eos": list(eng.eos),
+            "kv_dtype": a.kv_dtype,
             "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
             "prompt_lengths": {k: len(v) for k, v in ids.items()}}
     print(json.dumps(info), flush=True)
@@ -126,7 +145,8 @@ def main() -> int:
             fp32.buf = Buffers(eng.e.w, eng.e.rows, eng.e.capacity)
 
         for label, t in (("teacher", eng.serial), ("teacher32", fp32)):
-            teach(label, name, prompt, t, toks)
+            if label in a.teachers.split(","):
+                teach(label, name, prompt, t, toks)
 
     (out / "results.json").write_text(json.dumps({"info": info, "results": results}, indent=1) + "\n")
     if rec is not None:

@@ -13,6 +13,8 @@ from pathlib import Path
 def const(v):
     """A constexpr as Zig compares it: ints and bools as integers, floats by their fp32 bits."""
 
+    if v is None:
+        return {}               # a None argument Triton folded (an unused pointer): nothing to match
     if isinstance(v, bool):
         return {"int": int(v)}
     if isinstance(v, int):

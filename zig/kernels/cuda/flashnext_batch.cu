@@ -241,3 +241,117 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm(
     const float gs = warp_sum(o);
     if (lane == 0) xs[(size_t)r * (NV * DV / 32) + hv * (DV / 32) + warp] = gs;
 }
+
+// ---- sparse attention (QSA): each row's blocks ----------------------------------------------------------------------
+
+// attention._select's order-preserving key of a block score: negative floats flipped, positive ones topped.
+__device__ __forceinline__ uint32_t fn_qsa_key(float v) {
+    const uint32_t bits = __float_as_uint(v);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// An inclusive block-wide sum of one int a thread (blockDim.x a multiple of 32, at most 1024); *total gets the sum.
+__device__ __forceinline__ int fn_block_scan(int v, int* warp_sums, int* total) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (int o = 1; o < 32; o <<= 1) {
+        const int n = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += n;
+    }
+    if (lane == 31) warp_sums[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < warps ? warp_sums[lane] : 0;
+        for (int o = 1; o < 32; o <<= 1) {
+            const int n = __shfl_up_sync(0xffffffffu, w, o);
+            if (lane >= o) w += n;
+        }
+        if (lane < warps) warp_sums[lane] = w;
+    }
+    __syncthreads();
+    if (warp > 0) v += warp_sums[warp - 1];
+    *total = warp_sums[warps - 1];
+    __syncthreads();
+    return v;
+}
+
+// attention._select and _select_tiles as one kernel, a row a block: a row of rows P0 .. P0 + R - 1 with more than
+// `top` complete blocks lists its `top` best blocks (scores sc[r][0 .. complete), ties to the lower block id) in block
+// order, `ratio` keys each, then its unfinished tail; nkr gets its key count and spr 1. A row at or under `top`
+// blocks keeps its dense length (spr 0). The cut is the top-th largest key by radix select (a byte a pass from the
+// top, _select_tiles' passes; _select's bisection finds the same key), so the lists match either Triton kernel.
+extern "C" __global__ void __launch_bounds__(1024) fn_qsa_select(const float* __restrict__ sc,
+                                                                 const int* __restrict__ pos0, int* __restrict__ ids,
+                                                                 int* __restrict__ nkr, int* __restrict__ spr, int nb,
+                                                                 int idw, int top, int ratio) {
+    __shared__ int hist[256];
+    __shared__ int warp_sums[32];
+    __shared__ uint32_t cut_s;
+    __shared__ int need_s;
+    const int r = blockIdx.x;
+    const int end = *pos0 + r + 1;
+    const int complete = end / ratio;
+    if (complete <= top) {
+        if (threadIdx.x == 0) {
+            nkr[r] = end;
+            spr[r] = 0;
+        }
+        return;
+    }
+    const float* row = sc + static_cast<long long>(r) * nb;
+    int* out = ids + static_cast<long long>(r) * idw;
+    uint32_t cut = 0;
+    int need = top;
+    for (int p = 0; p < 4; ++p) {
+        const int shift = 24 - 8 * p;
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        for (int b = threadIdx.x; b < complete; b += blockDim.x) {
+            const uint32_t k = fn_qsa_key(row[b]);
+            if (p == 0 || (k >> (shift + 8)) == (cut >> (shift + 8))) atomicAdd(&hist[(k >> shift) & 0xFF], 1);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int above = 0;            // keys under the prefix with a larger byte
+            int d = 255;
+            for (; d > 0; --d) {
+                if (above + hist[d] >= need) break;
+                above += hist[d];
+            }
+            need_s = need - above;
+            cut_s = cut | (static_cast<uint32_t>(d) << shift);
+        }
+        __syncthreads();
+        cut = cut_s;
+        need = need_s;
+        __syncthreads();
+    }
+    // every key above the cut, then the first `need` keys equal to it, placed in block order
+    int seen = 0;
+    int placed = 0;
+    for (int t0 = 0; t0 < complete && placed < top; t0 += blockDim.x) {
+        const int b = t0 + threadIdx.x;
+        const bool ok = b < complete;
+        const uint32_t k = ok ? fn_qsa_key(row[b]) : 0u;
+        const bool above = ok && k > cut;
+        const bool equal = ok && k == cut;
+        int eq_total = 0;
+        const int rank = seen + fn_block_scan(equal ? 1 : 0, warp_sums, &eq_total);
+        const bool chosen = above || (equal && rank <= need);
+        int ch_total = 0;
+        const int place = placed + fn_block_scan(chosen ? 1 : 0, warp_sums, &ch_total) - 1;
+        if (chosen)
+            for (int j = 0; j < ratio; ++j) out[place * ratio + j] = b * ratio + j;
+        seen += eq_total;
+        placed += ch_total;
+    }
+    if (threadIdx.x < ratio) {
+        const int tail = ratio * complete + threadIdx.x;
+        if (tail < end) out[top * ratio + threadIdx.x] = tail;
+    }
+    if (threadIdx.x == 0) {
+        nkr[r] = top * ratio + end - ratio * complete;
+        spr[r] = 1;
+    }
+}

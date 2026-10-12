@@ -565,7 +565,8 @@ pub fn Trainer(comptime Tri: type) type {
                 .k = &e.batch_k,
                 .s = s,
                 .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
-                .seq = .{ .conv = t.seq.conv, .state = t.seq.state, .kc = t.seq.kc, .vc = t.seq.vc, .ikc = t.seq.ikc, .tail = t.seq.tail, .history = &t.seq.history },
+                // a sequence of at most max_rows (512) tokens never reaches the block indexer (past 2,048 keys): no scores
+                .seq = .{ .conv = t.seq.conv, .state = t.seq.state, .kc = t.seq.kc, .vc = t.seq.vc, .ikc = t.seq.ikc, .ks = t.seq.ks, .vs = t.seq.vs, .kv_bits = t.seq.kv_bits, .pooled = t.seq.pooled, .tail = t.seq.tail, .history = &t.seq.history, .cap = t.seq.cap, .scores = 0 },
                 .hooks = .{ .logits = if (mode == .keys) .none else .all, .logits_out = t.logits, .keep = &keep, .moe_add = .{ .ctx = t, .add = moeAdd } },
             };
             var list: [max_seqs]batch.Span = undefined;
