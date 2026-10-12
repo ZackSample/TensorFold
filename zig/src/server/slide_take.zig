@@ -89,7 +89,7 @@ pub fn take(srv: *Server, cx: *Cx, got: *Got, fact: []const u8, f: usize, qs: []
 /// A question written with the answer the model gives it from the fact, unless it gives that answer away or misses it.
 fn write(srv: *Server, cx: *Cx, words: []const []const u8, named: []const []const u8, siblings: []const []const u8, fact: []const u8, f: usize, q: []const u8, end: []const u32, thinking: bool, document: bool, self: bool, judge: bool, gone: anytype) !?Written {
     const a = cx.a;
-    const own_value = wording.yesNo(q) and wording.tells(fact, "", "", q); // "Do I like red?" after "I like red."
+    const own_value = wording.asksYesNo(q, self) and wording.tells(fact, "", "", q); // "Do I like red?" after "I like red."
     if (judge and own_value) {
         log.line("slide: \"{s}\" asks yes or no about the fact itself, so it is dropped", .{q});
         return null;
@@ -119,7 +119,9 @@ fn write(srv: *Server, cx: *Cx, words: []const []const u8, named: []const []cons
         return null;
     };
     // a built yes-or-no question on the fact's own value is the model saying yes knowing it, which names nothing new
-    if (if (!judge and own_value) !std.ascii.startsWithIgnoreCase(answer, "yes") else !wording.asks(fact, q, answer)) {
+    // (about the model, a no that says the fact counts too: "Do you need RAG to learn?" "No, I learn into my weights.")
+    const yes = std.ascii.startsWithIgnoreCase(answer, "yes") or (self and std.ascii.startsWithIgnoreCase(answer, "no") and wording.asks(fact, q, answer));
+    if (if (!judge and own_value) !yes else !wording.asks(fact, q, answer)) {
         log.line("slide: \"{s}\" brings back no word of the fact it lacks, so it is dropped", .{q});
         return null;
     }

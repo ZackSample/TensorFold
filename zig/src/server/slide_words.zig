@@ -13,6 +13,7 @@ const punctuation = units.punctuation;
 const Allocator = std.mem.Allocator;
 const whom = @import("slide_whom.zig");
 pub const yesNo = whom.yesNo;
+pub const asksYesNo = whom.asksYesNo;
 pub const firstPerson = whom.firstPerson;
 pub const toModel = whom.toModel;
 pub const secondPerson = whom.secondPerson;
@@ -179,6 +180,29 @@ fn saysNumber(text: []const u8, value: u64) bool {
     var it: Units = .init(text);
     while (it.next()) |u| if (!u.paired) if (numberOf(u.raw)) |v| if (v == value) return true;
     return false;
+}
+
+/// Whether `question` leaves out a word of `fact` a reply could bring back: "Would you say you're a woman?" says all of
+/// "You are a woman.", so its "Yes, I am a woman." can never show recall. A grammar word never counts ("Your" opening
+/// a fact reads as the unit "yor", which no question says).
+pub fn lacks(fact: []const u8, question: []const u8) bool {
+    var it: Units = .init(fact);
+    while (it.next()) |u| {
+        if (!u.marked() or says(question, u.word)) continue;
+        var buf: [16]u8 = undefined;
+        const raw = std.mem.trim(u8, u.raw, ".,'\u{2019}");
+        if (raw.len <= buf.len and isFiller(std.ascii.lowerString(&buf, raw))) continue;
+        return true;
+    }
+    return false;
+}
+
+test "a wording that says the whole fact lacks nothing a reply could bring back" {
+    try std.testing.expect(!lacks("You are a woman.", "Would you say you're a woman?"));
+    try std.testing.expect(lacks("You are a woman.", "What is your gender?"));
+    try std.testing.expect(lacks("My sister is called Ana.", "What is my sister called?"));
+    try std.testing.expect(!lacks("Your humor is dark and crude, and you love banter.", "Do you have a dark and crude sense of humor and love banter?"));
+    try std.testing.expect(lacks("Your humor is dark and crude, and you love banter.", "How would you describe your sense of humor?"));
 }
 
 pub fn isFiller(word: []const u8) bool {

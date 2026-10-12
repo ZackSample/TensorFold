@@ -15,6 +15,26 @@ pub fn yesNo(question: []const u8) bool {
     return false;
 }
 
+/// Whether a question asks yes or no: as `yesNo` reads one about the user (never "Do you remember...?", which asks
+/// the model to recall), or, for a fact about the model (`self`), any question opening with a verb ("Can you learn
+/// into your own weights?", "Are you a woman?"), which is what a question to the model about itself mostly is.
+pub fn asksYesNo(question: []const u8, self: bool) bool {
+    if (!self) return yesNo(question);
+    const verbs = [_][]const u8{ "is", "are", "am", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could", "will", "would", "should" };
+    var it = std.mem.tokenizeAny(u8, question, delimiters);
+    const first = it.next() orelse return false;
+    for (verbs) |v| if (std.ascii.eqlIgnoreCase(first, v)) return true;
+    return false;
+}
+
+test "a question to the model about itself that opens with a verb asks yes or no" {
+    try std.testing.expect(asksYesNo("Can you learn new things into your own weights?", true));
+    try std.testing.expect(asksYesNo("Are you a woman?", true));
+    try std.testing.expect(!asksYesNo("What is your name?", true));
+    try std.testing.expect(!asksYesNo("Do you remember my name?", false));
+    try std.testing.expect(asksYesNo("Do I like red?", false));
+}
+
 /// I and my (and Polish first-person verbs) in Polish, German, French, Spanish, Italian, Portuguese and Dutch.
 pub const own_words = [_][]const u8{ "mój", "moja", "moje", "mojego", "mojej", "moim", "moją", "moi", "mnie", "nasz", "nasza", "nasze", "naszego", "jestem", "mam", "lubię", "mieszkam", "pracuję", "ich", "mein", "meine", "meinen", "meinem", "meiner", "mir", "mich", "wir", "unser", "unsere", "moi", "nous", "notre", "yo", "mis", "mío", "mía", "nosotros", "nuestro", "nuestra", "mio", "miei", "noi", "nostro", "nostra", "meu", "minha", "meus", "nós", "nosso", "nossa", "ik", "mijn", "mij", "wij" };
 
