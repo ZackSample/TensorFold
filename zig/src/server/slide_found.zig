@@ -38,7 +38,9 @@ fn reversed(srv: *Server, cx: *Cx, found: []const []const u8, text: []const u8, 
         replies: [][]const u8,
 
         pub fn run(j: *const @This(), i: usize) !void {
-            if (wording.firstPerson(j.found[i])) return;
+            // the user's own facts, and those told to the model about itself ("You live on a DGX Spark in Zack's home
+            // lab."), are asked of the user or the model: no other way round reaches them
+            if (wording.firstPerson(j.found[i]) or wording.addressesModel(j.found[i])) return;
             var jcx: Cx = .{ .a = j.a };
             const r = try askBase(j.srv, &jcx, null, try std.fmt.allocPrint(j.a, prompts.reverse_prompt, .{j.found[i]}), 48, j.gone);
             j.replies[i] = r.content;
