@@ -89,6 +89,19 @@ pub fn factSubject(a: std.mem.Allocator, phrase: []const u8, fact: []const u8, q
     return proper;
 }
 
+/// Why a told fact's subject is no subject to key on (null: it is one): the phrase is the whole fact, or fewer than
+/// half the fact's questions name it ("The engine you run on is called TensorFold." picked TensorFold, its answer;
+/// "Zack's GitHub name is ZackSample." picked Zack, where the user's questions say my). Such a fact keys on the reply.
+pub fn unkeyedBy(phrase: []const u8, fact: []const u8, words: []const []const u8, proper: []const []const u8, qs: []const []const u8) ?[]const u8 {
+    if (qs.len == 0 or words.len == 0) return null;
+    const bare = std.mem.trim(u8, fact, " \t\r\n.!?\"'");
+    if (4 * phrase.len >= 3 * bare.len) return "is the whole fact";
+    var said: usize = 0;
+    for (qs) |q| said += @intFromBool(names(proper, words, q));
+    if (2 * said < qs.len) return "is named by fewer than half its questions";
+    return null;
+}
+
 /// The fact's own capitalised words, which join its subject's when its questions say them too ("Quillmoor").
 pub fn properWords(a: std.mem.Allocator, phrase_words: []const []const u8, fact: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
@@ -204,6 +217,27 @@ test "a fact's subject keeps its own proper names; a phrase without any takes th
     const told = try factSubject(a, "My dog", "My dog is called Ginger.", &dog, false);
     try std.testing.expectEqual(@as(usize, 1), told.len);
     try std.testing.expectEqualStrings("dog", told[0]);
+}
+
+test "a told fact's subject its questions never say, or the whole fact, is no subject: it keys on the reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const engine = [_][]const u8{ "What is the name of the engine I run on?", "Do you know what my engine is called?", "What do you call the engine I use?" };
+    const fact = "The engine you run on is called TensorFold.";
+    const tf = try factSubject(a, "TensorFold", fact, &engine, false);
+    try std.testing.expect(unkeyedBy("TensorFold", fact, tf, try named(a, tf, fact, &engine), &engine) != null);
+    const git = [_][]const u8{ "What is my GitHub name?", "Do you know my GitHub username?", "What is my username on GitHub?" };
+    const zack = try factSubject(a, "Zack", "Zack's GitHub name is ZackSample.", &git, false);
+    try std.testing.expect(unkeyedBy("Zack", "Zack's GitHub name is ZackSample.", zack, try named(a, zack, "Zack's GitHub name is ZackSample.", &git), &git) != null);
+    const humor = "I know your humor is dark and crude, and that you love banter.";
+    const jokes = [_][]const u8{ "What kind of humor do I say you have?", "How do I describe your humor?" };
+    const whole = try subjectWords(a, "I know your humor is dark and crude, and that you love banter");
+    try std.testing.expectEqualStrings("is the whole fact", unkeyedBy("I know your humor is dark and crude, and that you love banter", humor, whole, &.{}, &jokes).?);
+    // a subject most questions name stays: "My dog is called Ginger." keys on dog
+    const dog = [_][]const u8{ "What is my dog called?", "What is my dog's name?", "What did I name my dog?" };
+    const told = try factSubject(a, "My dog", "My dog is called Ginger.", &dog, false);
+    try std.testing.expect(unkeyedBy("My dog", "My dog is called Ginger.", told, try named(a, told, "My dog is called Ginger.", &dog), &dog) == null);
 }
 
 const unkeyed = [_][]const u8{ "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "you", "your", "yours", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom", "whose", "where", "when", "why", "how", "do", "does", "did", "is", "are", "was", "like", "likes" };

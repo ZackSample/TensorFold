@@ -333,6 +333,15 @@ fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
         got.named = try slide_subject.named(a, got.words, fact, qs);
         log.line("slide: its subject is \"{s}\": {s} (a question names it by {s})", .{ phrase, try std.mem.join(a, " ", got.words), try std.mem.join(a, " or ", if (got.named.len > 0) got.named else got.words) });
         if (got.words.len == 0) got.entity = false;
+        // a told fact's subject its questions do not name (its answer, the user's own name) or the whole fact: the
+        // questions would all be dropped as not naming it, so the fact keys on the reply as one about the user does
+        const why = if (got.entity and !parts.document) slide_subject.unkeyedBy(phrase, fact, got.words, got.named, qs) else null;
+        if (why) |w| {
+            log.line("slide: its subject \"{s}\" {s}, so it keys on the reply", .{ phrase, w });
+            got.entity = false;
+            got.words = &.{};
+            got.named = &.{};
+        }
     }
     parts.words = got.words;
     parts.named = got.named;
