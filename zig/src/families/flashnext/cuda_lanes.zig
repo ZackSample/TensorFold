@@ -29,7 +29,7 @@ pub fn Namespace(comptime Tri: type) type {
             backend: be.Backend,
             facts: lanes.Model,
             rows: u32,
-            /// Device bytes each admitted stream allocates: its own caches at the server's window (and the pass's scratch).
+            /// Device bytes each admitted stream allocates: its own caches at the server's window.
             stream_bytes: usize,
             /// Every stream allocates its own sequence; none rides on the engine's.
             free_streams: u32 = 0,
@@ -140,14 +140,17 @@ pub fn Namespace(comptime Tri: type) type {
             own.set = try cuda.aot.Set.load(gpa, io, driver, ctx.device, kernels);
             errdefer own.set.deinit();
             own.engine = try prompt.Engine.init(gpa, io, driver, &own.stream, dir);
+            errdefer own.engine.deinit();
+            // the batched pass's scratch for a prompt filling the window, once for the engine (every stream's
+            // prompt runs on it): allocated now, inside the load's reserve, not at the first long prompt
+            _ = try own.engine.reserve(@min(o.context, prompt.batch.default_chunk));
             own.lanes = .empty;
             own.next = 0;
             return .{
                 .backend = own.backend(),
                 .facts = Cuda.facts(),
                 .rows = 1,
-                // the stream's caches and the batched pass's scratch for a prompt filling the window (one stream)
-                .stream_bytes = prompt.seqBytes(o.context) + prompt.batch.Scratch.bytes(@min(o.context, prompt.batch.default_chunk)),
+                .stream_bytes = prompt.seqBytes(o.context),
                 .ctx = own,
                 .deinit = release,
             };

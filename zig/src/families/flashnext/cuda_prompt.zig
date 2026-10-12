@@ -360,7 +360,7 @@ pub const Engine = struct {
     }
 
     /// Scratch for chunks of `rows` rows, reallocated only to grow.
-    fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
+    pub fn reserve(e: *Engine, rows: usize) !*batch.Scratch {
         if (e.batch_s) |*bs| {
             if (bs.cap >= rows) return bs;
             try e.stream.synchronize();
@@ -378,7 +378,7 @@ pub const Engine = struct {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
         const training = hooks.keep != null or hooks.nudge != null or hooks.moe_add != null or hooks.taps != null or hooks.logits == .all;
         if (training and ids.len > e.chunk) return error.UnexpectedTensor;
-        const s = try e.batchScratch(@min(ids.len, e.chunk));
+        const s = try e.reserve(@min(ids.len, e.chunk));
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
             .io = e.io,
