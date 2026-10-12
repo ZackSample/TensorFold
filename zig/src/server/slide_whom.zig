@@ -43,6 +43,9 @@ const models_words = [_][]const u8{ "your", "yours", "yourself", "you're", "you'
 /// Verbs a question asks with, after which "you" is the one asked ("Do you know...?"), not the one asked about.
 const auxiliaries = [_][]const u8{ "do", "does", "did", "can", "could", "will", "would", "should", "are", "were", "have", "has", "had", "may", "might", "shall", "must" };
 
+/// Verbs of telling: "you" after them hears about something ("the name I told you"), it is not what is asked about.
+const telling = [_][]const u8{ "tell", "told", "say", "said", "show", "showed", "shown", "mention", "mentioned", "remind", "reminded", "ask", "asked" };
+
 fn isAny(w: []const u8, list: []const []const u8) bool {
     for (list) |x| if (std.ascii.eqlIgnoreCase(w, x)) return true;
     return false;
@@ -71,7 +74,7 @@ pub fn secondPerson(question: []const u8) bool {
         subject = subject or std.ascii.eqlIgnoreCase(w, "i") or std.ascii.eqlIgnoreCase(w, "we");
         if (std.ascii.eqlIgnoreCase(w, "you")) {
             you = true;
-            done_to = done_to or !isAny(last, &auxiliaries);
+            done_to = done_to or !(isAny(last, &auxiliaries) or isAny(last, &telling));
         }
         last = w;
     }
@@ -79,6 +82,12 @@ pub fn secondPerson(question: []const u8) bool {
     for ([_][]const u8{ "あなた", "君", "きみ" }) |f| if (std.mem.indexOf(u8, question, f) != null) return true;
     // with the user as subject ("Do you know what I like?") only a you something is done to asks about the model
     return yours or (you and (!subject or done_to));
+}
+
+/// Whether a question is one a fact of its kind answers: for a fact about the model (`self`), the model asked about
+/// itself; else the user asking about themselves, never about the model ("What name did I give you?").
+pub fn asksOf(question: []const u8, self: bool) bool {
+    return if (self) secondPerson(question) else firstPerson(question) and !secondPerson(question);
 }
 
 /// The question asked about the user instead of the model (your as my, you as I or me), or null when it says neither.
@@ -272,9 +281,13 @@ test "a told fact that speaks to the model, and questions that ask the model abo
         try std.testing.expect(secondPerson(q));
     for ([_][]const u8{ "What's my name?", "Do you know who I am?", "Do you remember my name?", "Do you know what I like?", "Who is my sister?", "What is the capital of France?", "Say hi to me by name." }) |q|
         try std.testing.expect(!secondPerson(q));
-    // a user question and a model question never pass both filters
-    for ([_][]const u8{ "What's my name?", "Do you remember my name?", "What is your name?", "Who are you?", "What did I name you?" }) |q|
-        try std.testing.expect(!(firstPerson(q) and secondPerson(q)) or std.mem.eql(u8, q, "What did I name you?"));
+    // a question is a user fact's or a self fact's, never both: "What name did I give you?" asks the model's name,
+    // "What is the name I told you?" the user's
+    for ([_][]const u8{ "What's my name?", "Do you remember my name?", "What is your name?", "Who are you?", "What did I name you?", "What name did I give you?", "What is the name I told you?", "Do you remember what I call myself?" }) |q|
+        try std.testing.expect(asksOf(q, true) != asksOf(q, false));
+    try std.testing.expect(asksOf("What name did I give you?", true));
+    try std.testing.expect(asksOf("What is the name I told you?", false));
+    try std.testing.expect(asksOf("Do you remember which colour I like?", false));
 }
 
 test "a question about the model asked about the user instead" {

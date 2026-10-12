@@ -416,7 +416,7 @@ fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
         const again = try askBase(srv, cx, null, try prompted(a, prompts.remember_prompt, remember_other, .{plain.items}, language), 32 * remember_probes, gone);
         var mine: std.ArrayList([]const u8) = .empty;
         for (try wording.questions(a, again.content, remember_probes)) |q| {
-            if (wording.firstPerson(q)) try mine.append(a, q) else log.line("slide: \"{s}\" is no longer the user's question, so it is dropped", .{q});
+            if (wording.asksOf(q, false)) try mine.append(a, q) else log.line("slide: \"{s}\" is no longer the user's question, so it is dropped", .{q});
         }
         try take(srv, cx, &got, fact, f, mine.items, end, parts.thinks, parts.document, gone);
     }
@@ -512,7 +512,7 @@ fn routerData(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
         const why: ?[]const u8 = if (personal or !units.sameScript(fact, q)) (if (parts.self) "is not a question to the model about itself" else "is not the user asking about themselves") else if (wording.gives(fact, asked_all, answered_all, q)) "gives the fact away" else if (!try slide_take.judgedAs(srv, cx, fact, q, parts.self, gone)) "is not answered by the fact" else if (try siblingAnswers(srv, cx, parts.siblings, fact, q, gone)) "is another fact's" else null;
         if (why) |w| {
             // a wording about the model (or for a fact about the model, the user) or someone else is one it must not take
-            const own = if (parts.self) wording.secondPerson(q) else wording.firstPerson(q);
+            const own = wording.asksOf(q, parts.self);
             const other = !parts.document and !own and units.sameScript(fact, q) and !wording.gives(fact, asked_all, answered_all, q);
             if (other) try parts.unasked.append(a, try slide_ask.promptOnly(srv, cx, a, null, q));
             log.line("slide: \"{s}\" {s}, so its router {s}", .{ q, w, if (other) "reads it as one it must not take" else "does not read it" });
@@ -636,10 +636,10 @@ fn aboutSelf(srv: *Server, cx: *Cx, fact: []const u8, gone: anytype) !bool {
 }
 
 /// Whether the fact answers `question`, as the model judges it when asked so (never one about someone it leaves out,
-/// and for a fact about the model, never one that does not ask the model about itself).
+/// and never one about the model for a fact about the user, nor the other way round).
 fn answered(srv: *Server, cx: *Cx, fact: []const u8, question: []const u8, document: bool, self: bool, gone: anytype) !bool {
     if (!document and wording.someoneElse(fact, question)) return false;
-    if (self and !wording.secondPerson(question)) return false;
+    if (!document and wording.secondPerson(question) != self) return false;
     const reply = try askBase(srv, cx, null, try (if (self) std.fmt.allocPrint(cx.a, prompts.self_judge_prompt, .{ fact, question }) else std.fmt.allocPrint(cx.a, prompts.judge_prompt, .{ fact, question })), 4, gone);
     const yes = std.ascii.startsWithIgnoreCase(std.mem.trim(u8, reply.content, " \t\r\n\"*"), "yes");
     if (yes) log.line("slide: \"{s}\" is answered by the fact, so it is learned rather than kept", .{question});

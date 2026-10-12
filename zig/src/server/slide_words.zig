@@ -16,6 +16,7 @@ pub const yesNo = whom.yesNo;
 pub const firstPerson = whom.firstPerson;
 pub const toModel = whom.toModel;
 pub const secondPerson = whom.secondPerson;
+pub const asksOf = whom.asksOf;
 pub const addressesModel = whom.addressesModel;
 pub const asUser = whom.asUser;
 pub const About = whom.About;

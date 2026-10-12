@@ -97,8 +97,12 @@ fn write(srv: *Server, cx: *Cx, words: []const []const u8, named: []const []cons
         log.line("slide: \"{s}\" does not name the fact's subject, so it is dropped", .{q});
         return null;
     }
-    if ((!document and !whose(fact, q, self)) or !units.sameScript(fact, q) or !try judgedAs(srv, cx, fact, q, self, gone)) {
-        log.line("slide: \"{s}\" is not {s} what the fact answers, so it is dropped", .{ q, if (self) "a question to the model about itself asking" else "the user asking" });
+    if ((!document and !whose(fact, q, self)) or !units.sameScript(fact, q)) {
+        log.line("slide: \"{s}\" is not {s}, so it is dropped", .{ q, if (self) "a question to the model about itself" else "the user asking about themselves" });
+        return null;
+    }
+    if (!try judgedAs(srv, cx, fact, q, self, gone)) {
+        log.line("slide: \"{s}\" is not answered by the fact, so it is dropped", .{q});
         return null;
     }
     if (try siblingAnswers(srv, cx, siblings, fact, q, gone)) return null;
@@ -250,7 +254,7 @@ pub fn judgedAs(srv: *Server, cx: *Cx, fact: []const u8, question: []const u8, s
 /// the model, the model about itself (you, your); never about someone the fact leaves out (he, my sister).
 pub fn whose(fact: []const u8, question: []const u8, self: bool) bool {
     if (wording.someoneElse(fact, question)) return false;
-    return if (self) wording.secondPerson(question) else wording.firstPerson(question);
+    return wording.asksOf(question, self);
 }
 
 /// What the model is told before it answers a fact's question: as the user told it, read in a document, or about itself.
@@ -264,6 +268,7 @@ test "a fact's questions are the user's own, or for a fact about the model, the 
     try std.testing.expect(whose("My name is Zack.", "What's my name?", false));
     try std.testing.expect(!whose("My name is Zack.", "What's your name?", false));
     try std.testing.expect(!whose("My name is Zack.", "What's my sister's name?", false));
+    try std.testing.expect(!whose("My name is Zack.", "What name did I give you?", false));
     try std.testing.expect(whose("Your name is Nyx.", "What's your name?", true));
     try std.testing.expect(whose("Your name is Nyx.", "Who are you?", true));
     try std.testing.expect(!whose("Your name is Nyx.", "What's my name?", true));
