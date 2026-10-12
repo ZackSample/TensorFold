@@ -147,6 +147,8 @@ fn rounds(srv: *Server, a: Allocator, cx: *errors.Cx, plan: teach.Plan, gone: Go
     var repaired: u32 = 0;
     // the facts learned before, as they stood when this lesson began: what its checks find forgotten is against these
     const before = srv.slide.earlier(a, id) catch &.{};
+    // broad questions as answered before it, which a kept lesson's answers are compared with for made-up names
+    const broad_before = recheck.askBroad(srv, cx, gone) catch &.{};
     var unchecked = false; // the lesson was fitted again after its last check
     var streak: u32 = 0; // rounds in a row whose held-out questions came back when asked
     var ever = false; // a round whose held-out questions all came back when asked
@@ -216,7 +218,10 @@ fn rounds(srv: *Server, a: Allocator, cx: *errors.Cx, plan: teach.Plan, gone: Go
                 takeOut(srv, a, &out, id, std.fmt.allocPrint(a, "taken out: the facts learned before could not be asked again ({s})", .{words(cx, e)}) catch "taken out");
                 return out;
             };
-            if (lost.len == 0) return out;
+            if (lost.len == 0) {
+                if (broad_before.len > 0) drift(srv, cx, o, id, plan, broad_before, gone);
+                return out;
+            }
             const who = recheck.names(a, lost) catch "an earlier fact";
             if (repaired < recheck.repairs) {
                 const back = recheck.keeps(srv, cx, lost) catch |e| {
@@ -280,6 +285,19 @@ fn earlierLost(srv: *Server, cx: *errors.Cx, o: *Out, id: u32, before: []const s
     log.line("slide: fact {d}'s lesson: the {d} facts learned before asked again in {d:.1} s: {d} come back, {d} forgotten", .{ id, results.len, took, back, lost.len });
     o.event("rechecked", .{ .id = id, .facts = @as(u32, @intCast(results.len)), .recalled = back, .forgotten = @as(u32, @intCast(lost.len)), .seconds = took });
     return lost;
+}
+
+/// The broad questions asked again after a kept lesson: a reply that names what no learned fact said is flagged.
+fn drift(srv: *Server, cx: *errors.Cx, o: *Out, id: u32, plan: teach.Plan, before: []const []const u8, gone: Gone) void {
+    const a = cx.a;
+    const now_said = recheck.askBroad(srv, cx, gone) catch return;
+    var facts: std.ArrayList([]const u8) = .empty;
+    facts.appendSlice(a, plan.facts) catch return;
+    for (srv.slide.earlier(a, id) catch &.{}) |e| facts.append(a, e.text) catch return;
+    for (recheck.broad, before, now_said) |q, was, reply| if (recheck.invented(reply, was, q, facts.items)) |name| {
+        log.line("slide: fact {d}'s lesson: \"{s}\" now names \"{s}\", which no learned fact says: {s}", .{ id, q, name, reply });
+        o.event("drift", .{ .id = id, .question = q, .name = name, .reply = reply });
+    };
 }
 
 /// The open lesson taken out whole (its neurons free, earlier ones it fitted again as they were), and why.

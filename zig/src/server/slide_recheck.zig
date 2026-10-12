@@ -91,6 +91,72 @@ pub fn keeps(srv: *Server, cx: *Cx, lost: []const Result) !struct { prompts: []c
     return .{ .prompts = prompts.items, .kept = kept.items };
 }
 
+/// Broad questions no one fact answers, watched across a lesson: a learned fact may lead them to make things up
+/// ("Do you know who I am?" once named the user "Chumeng"). A name they say that no fact, nor the reply before, said is
+/// flagged; nothing is undone for it.
+pub const broad = [_][]const u8{ "Do you know who I am?", "What do you know about me?", "Tell me about yourself." };
+pub const broad_tokens = 64;
+
+/// The broad questions' replies now, side by side.
+pub fn askBroad(srv: *Server, cx: *Cx, gone: anytype) ![]const []const u8 {
+    var asking: [broad.len]side.Asking = undefined;
+    for (&asking, broad) |*x, q| x.* = .{ .question = q, .max = broad_tokens };
+    const replies = try side.askAll(srv, cx, &asking, gone);
+    const out = try cx.a.alloc([]const u8, replies.len);
+    for (out, replies) |*o, r| o.* = r.content;
+    return out;
+}
+
+/// The first name `reply` says (a capitalised word past a sentence's start) that neither `before`, `question` nor
+/// any of `facts` says, or null: a name the model made up.
+pub fn invented(reply: []const u8, before: []const u8, question: []const u8, facts: []const []const u8) ?[]const u8 {
+    const common = [_][]const u8{ "I", "I'm", "I've", "I'd", "I'll", "AI", "OK", "Yes", "No", "Hi", "Hello", "Hey", "However", "But", "And", "So", "Well", "Sure", "Of", "As", "If", "In", "On", "At", "My", "You", "Your", "The", "A", "An", "It", "This", "That", "What", "How", "Why", "Who", "When", "Where", "Is", "Are", "Do", "Can", "Please", "Thanks", "Thank" };
+    var at: usize = 0;
+    var start = true; // the word opens a sentence: its capital says nothing
+    while (at < reply.len) {
+        while (at < reply.len and !isWordByte(reply[at])) : (at += 1) {
+            if (reply[at] == '.' or reply[at] == '!' or reply[at] == '?' or reply[at] == '\n' or reply[at] == ':') start = true;
+        }
+        var end = at;
+        while (end < reply.len and isWordByte(reply[end])) end += 1;
+        if (end == at) break;
+        const raw = reply[at..end];
+        const word = std.mem.trimEnd(u8, if (std.mem.endsWith(u8, raw, "'s")) raw[0 .. raw.len - 2] else raw, "'");
+        const opens = start;
+        start = false;
+        at = end;
+        if (opens or word.len < 2 or !std.ascii.isUpper(word[0])) continue;
+        var known = false;
+        for (common) |c| known = known or std.ascii.eqlIgnoreCase(word, c);
+        known = known or hasWord(before, word) or hasWord(question, word);
+        for (facts) |f| known = known or hasWord(f, word);
+        if (!known) return word;
+    }
+    return null;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '\'' or c >= 0x80;
+}
+
+/// Whether `text` says `word` as a word of its own, in any case, possessive or not.
+fn hasWord(text: []const u8, word: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n,.;:!?()[]\"*-");
+    while (it.next()) |raw| {
+        const w = std.mem.trimEnd(u8, if (std.mem.endsWith(u8, raw, "'s")) raw[0 .. raw.len - 2] else raw, "'");
+        if (std.ascii.eqlIgnoreCase(w, word)) return true;
+    }
+    return false;
+}
+
+test "a broad question's reply that names what no fact said is flagged" {
+    const facts = [_][]const u8{ "My name is Zack.", "Zack is a contributor to TensorFold." };
+    try std.testing.expectEqualStrings("Chumeng", invented("Yes! You told me your name is **Chumeng**.", "No, I don't know who you are.", "Do you know who I am?", &facts).?);
+    try std.testing.expectEqualStrings("Trace", invented("You are Zack, and the model I run on is called **Trace**.", "No.", "Do you know who I am?", &facts).?);
+    try std.testing.expect(invented("Yes, I do. You told me earlier that your name is Zack.", "No.", "Do you know who I am?", &facts) == null);
+    try std.testing.expect(invented("I am Qwen, a model built by Alibaba Cloud.", "I am Qwen, a large language model by Alibaba Cloud.", "Tell me about yourself.", &facts) == null);
+}
+
 /// The facts in `rs` as one line: "I like blue.", "My sister is called Ana."
 pub fn names(a: Allocator, rs: []const Result) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
