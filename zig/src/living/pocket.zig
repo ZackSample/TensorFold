@@ -463,9 +463,12 @@ pub fn Pocket(comptime T: type, comptime F: family.Family) type {
         }
 
         /// Earlier neurons firing on this fact's rows refitted silent there, undo copies kept; same-subject ones stay.
+        /// A refit changes a neuron only on this fact's rows: wherever else it fires as read now (its own fact's
+        /// questions in the replay, a question a reroute handed back) it reads exactly as before, like its stored rows.
         fn quiet(p: *Self, t: *T, host: anytype) !void {
             const d = p.hidden;
             const n = p.slots();
+            const own = p.answered.len + p.prompts.len + p.held.len; // read examples below this are this fact's
             for (p.learned.items[0..p.learned_before]) |e| {
                 if (e.key == .subject and std.mem.indexOfScalar(u32, p.subjects.items, e.subject) != null) continue;
                 const u = p.neuron(p.up.items, e.slot, e.neuron, d);
@@ -485,7 +488,22 @@ pub fn Pocket(comptime T: type, comptime F: family.Family) type {
                     try xs.append(p.gpa, p.pos.items[(e.start + r) * d ..][0..d]);
                     try kinds.append(p.gpa, .fact);
                 }
-                for (p.labels.items, 0..) |l, i| {
+                // the rows of other prompts it fires on now are its own fact's as the model reads them today (the
+                // stored ones were read before any pocket neuron sat below it): held fixed with the stored ones, never
+                // pushed silent as rows of "other prompts" (which made it quiet on its own fact's questions)
+                const live = try p.gpa.alloc(bool, p.labels.items.len);
+                defer p.gpa.free(live);
+                var fixed = e.count;
+                for (p.labels.items, live, 0..) |l, *on, i| {
+                    const x = p.rows.items[(i * n + e.slot) * d ..][0..d];
+                    on.* = l.ex >= own and dotBf16(u, x) > 0;
+                    if (!on.*) continue;
+                    try xs.append(p.gpa, x);
+                    try kinds.append(p.gpa, .none); // fixed, so read as it was; a weak one is no stored row to judge by
+                    fixed += 1;
+                }
+                for (p.labels.items, live, 0..) |l, on, i| {
+                    if (on) continue;
                     try xs.append(p.gpa, p.rows.items[(i * n + e.slot) * d ..][0..d]);
                     try kinds.append(p.gpa, switch (l.kind) {
                         .fact, .held => .steady, // this fact's questions are another fact's to it
@@ -493,7 +511,7 @@ pub fn Pocket(comptime T: type, comptime F: family.Family) type {
                         else => l.kind,
                     });
                 }
-                const f = try fit(p.gpa, xs.items, kinds.items, d, u, true, fit_steps / 2, e.count, F.neuron.margin);
+                const f = try fit(p.gpa, xs.items, kinds.items, d, u, true, fit_steps / 2, fixed, F.neuron.margin);
                 if (f.fact_least < kept_least or @max(f.steady_most, f.other_most) > 0) {
                     // a refit that forgets its fact or spreads is undone; this fact's outputs are fitted with it firing
                     @memcpy(u, p.refit_up.items[p.refit_up.items.len - d ..]);
@@ -505,7 +523,7 @@ pub fn Pocket(comptime T: type, comptime F: family.Family) type {
                 }
                 p.gateFrom(e.slot, e.neuron);
                 try p.upload(t, host, e.slot);
-                std.log.info("slide pocket: layer {d}, neuron {d}, an earlier fact's, fired on this fact's questions (up to {d:.2}); fitted again: there and elsewhere at most {d:.2}, its own questions' least {d:.2}", .{ p.moe.items[e.slot], e.neuron, most, @max(f.steady_most, f.other_most), f.fact_least });
+                std.log.info("slide pocket: layer {d}, neuron {d}, an earlier fact's, fired on this fact's questions (up to {d:.2}); fitted again: there and elsewhere at most {d:.2}, its own questions' least {d:.2} ({d} rows held as they read, {d} of them read now)", .{ p.moe.items[e.slot], e.neuron, most, @max(f.steady_most, f.other_most), f.fact_least, fixed, fixed - e.count });
             }
         }
 
@@ -595,4 +613,133 @@ test "a read row is a fact's row only to its own key's neurons; another prompt's
     try std.testing.expectEqual(Kind.none, kindFor(.{ .kind = .none, .key = .subject, .ex = 1, .row = 4 }, .subject));
     try std.testing.expectEqual(Kind.other, kindFor(.{ .kind = .none, .key = .subject, .ex = 1, .row = 4 }, .reply));
     try std.testing.expectEqual(Kind.other, kindFor(.{ .kind = .other, .key = null, .ex = 1, .row = 5 }, .subject));
+}
+
+test "an earlier fact's neuron fitted quiet on a new fact's rows reads as before on its own fact's rows as read now" {
+    const gpa = std.testing.allocator;
+    const F = @import("families.zig").nemotron_h;
+    const T = struct {};
+    const P = Pocket(T, F);
+    const d = 64;
+    const NoHost = struct {
+        pub fn pocket(_: @This(), _: usize, _: []const f32, _: []const f32, _: usize) !void {}
+    };
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    // hidden states: a shared offset, noise, and a direction each fact's questions lean along; the new fact's
+    // questions lean much as the earlier fact's do (both ask about the user at the reply), so its neuron fires there
+    var common: [d]f32 = undefined;
+    var old_dir: [d]f32 = undefined;
+    var new_dir: [d]f32 = undefined;
+    var push: [d]f32 = undefined; // what the pocket's lower neurons add to the earlier fact's rows since it was read
+    for (&common, &old_dir, &push) |*c, *o, *u| {
+        c.* = 1 + r.floatNorm(f32) * 0.1;
+        o.* = r.floatNorm(f32);
+        u.* = r.floatNorm(f32) * 1.2;
+    }
+    for (&new_dir, old_dir) |*n, o| n.* = 0.8 * o + 0.6 * r.floatNorm(f32);
+    const n_old = 12;
+    const n_new = 12;
+    const n_rest = 160;
+    const Row = [d]u16;
+    const rowOf = struct {
+        fn f(rr: std.Random, cm: []const f32, lean: ?[]const f32, extra: ?[]const f32) Row {
+            var out: Row = undefined;
+            for (&out, 0..) |*x, k| {
+                var v = cm[k] + rr.floatNorm(f32) * 0.5;
+                if (lean) |dir| v += 1.5 * dir[k];
+                if (extra) |e| v += e[k];
+                x.* = @truncate(@as(u32, @bitCast(v)) >> 16);
+            }
+            return out;
+        }
+    }.f;
+    var stored: [n_old]Row = undefined; // the earlier fact's rows as its lesson read them
+    var live: [n_old]Row = undefined; // the same questions as read now, in the replay
+    for (&stored, &live) |*s, *l| {
+        s.* = rowOf(r, &common, &old_dir, null);
+        l.* = rowOf(r, &common, &old_dir, &push);
+    }
+    var p: P = .{ .gpa = gpa, .mode = .reply };
+    defer p.deinit();
+    p.hidden = d;
+    p.layers = 8;
+    try p.moe.append(gpa, 3);
+    try p.up.appendNTimes(gpa, 0, P.neurons * d);
+    try p.down.appendNTimes(gpa, 0, P.neurons * d);
+    try p.used.append(gpa, 1);
+    // the earlier fact's neuron, fitted on its stored rows against the rest
+    var xs: std.ArrayList([]const u16) = .empty;
+    defer xs.deinit(gpa);
+    var kinds: std.ArrayList(Kind) = .empty;
+    defer kinds.deinit(gpa);
+    var rest: [n_rest]Row = undefined;
+    for (&rest) |*x| x.* = rowOf(r, &common, null, null);
+    for (&stored) |*x| {
+        try xs.append(gpa, x);
+        try kinds.append(gpa, .fact);
+        try p.pos.appendSlice(gpa, x);
+    }
+    for (&rest) |*x| {
+        try xs.append(gpa, x);
+        try kinds.append(gpa, .other);
+    }
+    const u = p.neuron(p.up.items, 0, 0, d);
+    _ = try fit(gpa, xs.items, kinds.items, d, u, false, fit_steps, 0, F.neuron.margin);
+    try p.learned.append(gpa, .{ .slot = 0, .neuron = 0, .key = .reply, .start = 0, .count = n_old, .subject = 0 });
+    p.learned_before = 1;
+    // the new fact's read: its questions (its own examples), then other prompts: the earlier fact's in the replay first
+    var news: [n_new]Row = undefined;
+    for (&news) |*x| x.* = rowOf(r, &common, &new_dir, null);
+    const ex: Example = .{ .ids = &.{ 1, 2, 3 }, .start = 2, .decide = 1 };
+    const answered: [n_new]Example = @splat(ex);
+    p.answered = &answered;
+    for (&news, 0..) |*x, i| {
+        try p.rows.appendSlice(gpa, x);
+        try p.labels.append(gpa, .{ .kind = .fact, .key = .reply, .ex = @intCast(i), .row = 1 });
+    }
+    for (&live, 0..) |*x, i| {
+        try p.rows.appendSlice(gpa, x);
+        try p.labels.append(gpa, .{ .kind = .steady, .key = .reply, .ex = @intCast(n_new + i), .row = 1 });
+    }
+    for (rest[0 .. n_rest / 2], 0..) |*x, i| {
+        try p.rows.appendSlice(gpa, x);
+        try p.labels.append(gpa, .{ .kind = .steady, .key = .reply, .ex = @intCast(n_new + n_old + i), .row = 1 });
+    }
+    var most: f32 = -1;
+    for (&news) |*x| most = @max(most, dotBf16(u, x));
+    try std.testing.expect(most > refit_above); // it fires on the new fact's questions: a refit is due
+    const before = try gpa.dupe(f32, u);
+    defer gpa.free(before);
+    var t: T = .{};
+    try p.quiet(&t, NoHost{});
+    try std.testing.expectEqual(@as(usize, 1), p.refits.items.len);
+    for (&news) |*x| try std.testing.expect(dotBf16(u, x) <= 0);
+    // its own questions as read now and as stored read exactly as they did: it still answers its own fact
+    for (&live) |*x| try std.testing.expectApproxEqAbs(dotBf16(before, x), dotBf16(u, x), 1e-3);
+    for (&stored) |*x| try std.testing.expectApproxEqAbs(dotBf16(before, x), dotBf16(u, x), 1e-3);
+    // as rows of other prompts (the old refit), its own questions read now were pushed silent with the stored ones
+    // fixed: the forgetting this test guards against
+    xs.clearRetainingCapacity();
+    kinds.clearRetainingCapacity();
+    for (&stored) |*x| {
+        try xs.append(gpa, x);
+        try kinds.append(gpa, .fact);
+    }
+    for (&news) |*x| {
+        try xs.append(gpa, x);
+        try kinds.append(gpa, .steady);
+    }
+    for (&live) |*x| {
+        try xs.append(gpa, x);
+        try kinds.append(gpa, .steady);
+    }
+    const old = try gpa.dupe(f32, before);
+    defer gpa.free(old);
+    const of = try fit(gpa, xs.items, kinds.items, d, old, true, fit_steps / 2, n_old, F.neuron.margin);
+    // (its stored rows, the only ones it checked, still read as before, so nothing told it it had forgotten)
+    try std.testing.expect(of.fact_least >= kept_least);
+    var silenced: usize = 0;
+    for (&live) |*x| silenced += @intFromBool(dotBf16(old, x) < 0.5 and dotBf16(before, x) >= 0.5);
+    try std.testing.expect(silenced > n_old / 2);
 }
