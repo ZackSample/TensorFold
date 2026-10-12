@@ -16,7 +16,7 @@ pub fn Namespace(comptime Tri: type) type {
         pub const formats: []const []const u8 = &.{"mlx-q4g32"};
         // dense attention over the captured scratch (NCH chunks of 512 keys, QSA off): no sparse indexer yet
         pub const default_context: i64 = @intCast(prompt.max_tokens);
-        // a prompt runs as one pass of fused decode rows, the whole prompt at once: no staggered segments
+        // a prompt runs as one batched pass (cuda_batch.zig), the whole prompt at once: no staggered segments
         pub const max_segments: u32 = 1;
         pub const prompt_rows: u32 = @intCast(prompt.max_tokens);
 
@@ -29,7 +29,7 @@ pub fn Namespace(comptime Tri: type) type {
             backend: be.Backend,
             facts: lanes.Model,
             rows: u32,
-            /// Device bytes each admitted stream allocates: its own caches at the server's window.
+            /// Device bytes each admitted stream allocates: its own caches at the server's window (and the pass's scratch).
             stream_bytes: usize,
             /// Every stream allocates its own sequence; none rides on the engine's.
             free_streams: u32 = 0,
@@ -146,7 +146,8 @@ pub fn Namespace(comptime Tri: type) type {
                 .backend = own.backend(),
                 .facts = Cuda.facts(),
                 .rows = 1,
-                .stream_bytes = prompt.seqBytes(o.context),
+                // the stream's caches and the batched pass's scratch for a prompt filling the window (one stream)
+                .stream_bytes = prompt.seqBytes(o.context) + prompt.batch.Scratch.bytes(@min(o.context, prompt.batch.default_chunk)),
                 .ctx = own,
                 .deinit = release,
             };

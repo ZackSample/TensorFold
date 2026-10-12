@@ -232,5 +232,52 @@ pub fn main(init: std.process.Init) !u8 {
     const nudge_ok = before_same and moved > 0;
     std.debug.print("{s} nudge at row 10, layer 20: rows 0-9 {s}, row 10's scores move by up to {d:.3}\n", .{ if (nudge_ok) "PASS" else "FAIL", if (before_same) "unchanged" else "CHANGED", moved });
     if (!nudge_ok) failures += 1;
+
+    // (5) the pocket through moe_add (fn_back's pocketRows at layer 20, four SwiGLU neurons): with zero output
+    // vectors the scores are the prompt pass's byte for byte; with output vectors they move
+    var fk = try flash.fn_back.Kernels.load(&driver);
+    defer fk.deinit();
+    const Pocket = struct {
+        ops: flash.fn_back.Ops,
+        pk: flash.fn_back.Ops.Pocket,
+        calls: usize = 0,
+        fn add(me: *anyopaque, layer: usize, x: u64, ids_: u64, wts: u64, out: u64, rows: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(me));
+            self.calls += 1;
+            if (layer != 20) return;
+            try self.ops.pocketRows(self.pk, .{ .x = x, .ids = ids_, .wts = wts }, out, true, rows, dims, 10);
+        }
+    };
+    const neurons = 4;
+    const pk_gate = try bufs.get(neurons * dims * 4);
+    const pk_up = try bufs.get(neurons * dims * 4);
+    const pk_down = try bufs.get(neurons * dims * 4);
+    {
+        const host = try gpa.alloc(f32, neurons * dims);
+        defer gpa.free(host);
+        var rng = std.Random.DefaultPrng.init(7);
+        for (host) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.2;
+        try driver.check(driver.api.cuMemcpyHtoD_v2(pk_gate, host.ptr, host.len * 4), "cuMemcpyHtoD");
+        for (host) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.2;
+        try driver.check(driver.api.cuMemcpyHtoD_v2(pk_up, host.ptr, host.len * 4), "cuMemcpyHtoD");
+    }
+    var pocket: Pocket = .{ .ops = .{ .k = &fk, .s = stream }, .pk = .{ .gate = pk_gate, .up = pk_up, .down = pk_down, .n = neurons } };
+    var pocket_ok = true;
+    for (0..2) |round| {
+        if (round == 1) {
+            const host = try gpa.alloc(f32, neurons * dims);
+            defer gpa.free(host);
+            var rng = std.Random.DefaultPrng.init(11);
+            for (host) |*v| v.* = (rng.random().float(f32) - 0.5);
+            try driver.check(driver.api.cuMemcpyHtoD_v2(pk_down, host.ptr, host.len * 4), "cuMemcpyHtoD");
+        }
+        var sq = try e.newSeq(n + 1);
+        defer sq.deinit(gpa);
+        try e.forward(flash.Tri, tri, &sq, ids.items, .{ .moe_add = .{ .ctx = &pocket, .add = Pocket.add } });
+        const eq = std.mem.eql(u8, sq.logits, want);
+        if (eq != (round == 0)) pocket_ok = false;
+    }
+    std.debug.print("{s} pocket rows through moe_add at layer 20: zero output vectors keep the scores byte-equal, nonzero ones move them ({d} callbacks)\n", .{ if (pocket_ok) "PASS" else "FAIL", pocket.calls });
+    if (!pocket_ok) failures += 1;
     return if (failures == 0) 0 else 1;
 }

@@ -62,6 +62,11 @@ const qmm_smem: u32 = 9472;
 const plan_rank_symbol: [:0]const u8 = "_ZN10tf_experts9plan_rankEPKiiiPiS2_";
 const plan_offsets_symbol: [:0]const u8 = "_ZN10tf_experts12plan_offsetsEiiiPiS0_S0_";
 const plan_scatter_symbol: [:0]const u8 = "_ZN10tf_experts12plan_scatterEPKiiiS1_S1_Pi";
+/// flashnext_experts.cu: the decode experts' arithmetic over `rows_tile` rows a warp (two tiles of 16).
+const rows_up_symbol: [:0]const u8 = "_ZN13tf_fn_experts11expert_rowsILi32ELi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_Pvif";
+const rows_down_symbol: [:0]const u8 = "_ZN13tf_fn_experts11expert_rowsILi32ELi1ELi0ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_Pvif";
+/// Pairs an expert item takes: the plan's tile, the kernels' two row tiles of 16.
+const rows_tile: usize = 32;
 
 fn cint(v: usize) c_int {
     return @intCast(v);
@@ -114,6 +119,15 @@ pub const Keep = struct {
     pos0: usize = 0,
 };
 
+/// Called on the pass's stream once a layer has routed: `out` [rows, dims] fp32 holds the layer's nudge (zeros
+/// without one) and what the callback adds into it joins the layer's MoE output before the bf16 rounding, e.g.
+/// Living Weights' pocket neurons: fn_back's pocketRows(pocket, .{ x, ids, wts }, out, true, rows, dims, 10).
+/// x [rows, dims] bf16 is the MoE input, ids and wts [rows, 11] its experts and weights (the shared one last).
+pub const MoeAdd = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void,
+};
+
 /// A training caller's view into the pass. Without any, the pass is the server's prompt pass.
 pub const Hooks = struct {
     logits: Logits = .last,
@@ -122,17 +136,21 @@ pub const Hooks = struct {
     keep: ?*Keep = null,
     /// Each layer's [rows, dims] fp32 added to its MoE output before the bf16 rounding (0: none).
     nudge: ?*const [layers_n]u64 = null,
+    /// Rows a callback adds to each layer's MoE output (after the nudge), on the pass's stream.
+    moe_add: ?MoeAdd = null,
     taps: ?Taps = null,
 };
 
 /// The kernels the pass launches besides the captured Triton ones, loaded once.
 pub const Kernels = struct {
     qmm: cuda.Module,
-    gdn: cuda.Module,
     experts: cuda.Module,
+    rows: cuda.Module,
     batch: cuda.Module,
     lane: cuda.Function,
+    front: cuda.Function,
     chain: cuda.Function,
+    gnorm: cuda.Function,
     plan: cuda.Function,
     rank: cuda.Function,
     offsets: cuda.Function,
@@ -150,33 +168,35 @@ pub const Kernels = struct {
         var k: Kernels = undefined;
         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
         errdefer k.qmm.unload();
-        k.gdn = try cuda.Module.load(d, cuda.kernels.flashnext_gdn);
-        errdefer k.gdn.unload();
         k.experts = try cuda.Module.load(d, cuda.kernels.experts);
         errdefer k.experts.unload();
+        k.rows = try cuda.Module.load(d, cuda.kernels.flashnext_experts);
+        errdefer k.rows.unload();
         k.batch = try cuda.Module.load(d, cuda.kernels.flashnext_batch);
         errdefer k.batch.unload();
         k.lane = try k.qmm.function(cubin_qmm);
         try k.lane.allowDynamicShared(qmm_smem);
-        k.chain = try k.gdn.function("flashnext_gdn_chain");
         k.plan = try k.experts.function(wt.plan_symbol);
         k.rank = try k.experts.function(plan_rank_symbol);
         k.offsets = try k.experts.function(plan_offsets_symbol);
         k.scatter = try k.experts.function(plan_scatter_symbol);
-        k.up = try k.experts.function(wt.up_symbol);
-        k.down = try k.experts.function(wt.down_symbol);
+        k.up = try k.rows.function(rows_up_symbol);
+        k.down = try k.rows.function(rows_down_symbol);
         k.sum = try k.batch.function("fn_sum_slices");
         k.shift = try k.batch.function("fn_shift_window");
         k.combine = try k.batch.function("fn_combine");
         k.copy = try k.batch.function("fn_copy2d");
         k.copy32 = try k.batch.function("fn_copy2d32");
+        k.front = try k.batch.function("fn_gdn_front");
+        k.chain = try k.batch.function("fn_gdn_rows");
+        k.gnorm = try k.batch.function("fn_gdn_norm");
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.batch.unload();
+        k.rows.unload();
         k.experts.unload();
-        k.gdn.unload();
         k.qmm.unload();
     }
 };
@@ -201,6 +221,11 @@ pub const Scratch = struct {
     part: u64 = 0,
     gout: u64 = 0,
     gxs: u64 = 0,
+    ys: u64 = 0,
+    gq: u64 = 0,
+    gk: u64 = 0,
+    gv: u64 = 0,
+    ggb: u64 = 0,
     q: u64 = 0,
     iq: u64 = 0,
     po: u64 = 0,
@@ -220,6 +245,7 @@ pub const Scratch = struct {
     moe_act: u64 = 0,
     y: u64 = 0,
     branch: u64 = 0,
+    extra: u64 = 0,
     ple_emb: u64 = 0,
     ple_xs: u64 = 0,
     ple_keys: u64 = 0,
@@ -248,11 +274,12 @@ pub const Scratch = struct {
         n += cap * 4 + (cdiv(cap, att_rows) + 1) * 16;
         n += cap * wide * 2 * 2 + cap * pss_n * 4 + cap * (low + 4) * 2 + hc_sk * cap * (low + 4) * 4;
         n += cap * low * 2 + cap * (low / 32) * 4 + cap * streams * 2 + cap * dims * 2 + cap * (dims / 32) * 4;
-        n += cap * proj_row * 2 + out_sk * cap * dims * 4 + cap * gdn.value_dim * 2 + cap * (gdn.value_dim / 32) * 4;
+        n += cap * proj_row * 2 + out_sk * cap * dims * 4 + cap * gdn.value_dim * (2 + 4 + 4) + cap * (gdn.value_dim / 32) * 4;
+        n += cap * (2 * gdn.nk * gdn.dk + 2 * gdn.nv) * 4;
         n += cap * q_heads * head_dim * 2 + cap * index_heads * index_dim * 2;
         n += att_rows * nch * q_heads * (head_dim + 2) * 4 + cap * out_k * 2 * 2 + cap * (out_k / 32) * 4;
         n += cap * (experts_n + 1) * 4 + pairs * 4 * 2 + pairs * 4 + items * 3 * 4 + 8 + pairs * 4 + nblk * (experts_n + 1) * 4;
-        n += pairs * moe_w * 2 + pairs * dims * 4 + cap * dims * 2;
+        n += pairs * moe_w * 2 + pairs * dims * 4 + cap * dims * 2 + cap * dims * 4;
         n += cap * dims * 2 + cap * (dims / 32) * 4 + cap * wide * 2 + cap * dims * 2 + 4 * cap * dims * 4;
         n += cap * wide * 2 * 2 + cap * streams * 4 + vocab * 2 + half * 4 + 4096;
         return n;
@@ -280,6 +307,11 @@ pub const Scratch = struct {
         s.part = try s.add(gpa, d, out_sk * cap * dims * 4);
         s.gout = try s.add(gpa, d, cap * gdn.value_dim * 2);
         s.gxs = try s.add(gpa, d, cap * (gdn.value_dim / 32) * 4);
+        s.ys = try s.add(gpa, d, cap * gdn.value_dim * 4);
+        s.gq = try s.add(gpa, d, cap * gdn.nk * gdn.dk * 4);
+        s.gk = try s.add(gpa, d, cap * gdn.nk * gdn.dk * 4);
+        s.gv = try s.add(gpa, d, cap * gdn.value_dim * 4);
+        s.ggb = try s.add(gpa, d, cap * gdn.nv * 2 * 4);
         s.q = try s.add(gpa, d, cap * q_heads * head_dim * 2);
         s.iq = try s.add(gpa, d, cap * index_heads * index_dim * 2);
         s.po = try s.add(gpa, d, att_rows * nch * q_heads * head_dim * 4);
@@ -299,6 +331,7 @@ pub const Scratch = struct {
         s.moe_act = try s.add(gpa, d, pairs * moe_w * 2);
         s.y = try s.add(gpa, d, pairs * dims * 4);
         s.branch = try s.add(gpa, d, cap * dims * 2);
+        s.extra = try s.add(gpa, d, cap * dims * 4);
         s.ple_emb = try s.add(gpa, d, cap * dims * 2);
         s.ple_xs = try s.add(gpa, d, cap * (dims / 32) * 4);
         s.ple_keys = try s.add(gpa, d, cap * wide * 2);
@@ -456,7 +489,7 @@ pub fn Pass(comptime Tri: type) type {
             self.pending = null;
             const y = s.y + r0 * slots * dims * 4;
             const wts = s.wts + r0 * slots * 4;
-            const nudge: u64 = if (self.hooks.nudge) |nd| nd[from] else 0;
+            const nudge: u64 = if (self.hooks.moe_add != null) s.extra else if (self.hooks.nudge) |nd| nd[from] else 0;
             const keep: u64 = if (self.hooks.keep) |kp| kp.layers[from].moe_branch else 0;
             if (nudge == 0 and keep == 0) {
                 try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
@@ -517,20 +550,36 @@ pub fn Pass(comptime Tri: type) type {
             try self.copy(keep.proj, s.proj, n * gdn.proj_width * 2);
             try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
             try self.copy(keep.state, self.seq.state[li].ptr, state_n * 4);
+            // every row's conv, norms and gates at once, then the recurrence (a warp's 4 state rows each, 16 a block),
+            // then the gated norm per row: the one-block chain's bits (flashnext_batch.cu)
+            var f: cuda.Args = .{};
+            f.add(s.proj);
+            f.add(self.seq.conv[li].ptr);
+            f.add(lw.cw.ptr);
+            f.add(lw.a_log.ptr);
+            f.add(lw.dt.ptr);
+            f.add(s.gq);
+            f.add(s.gk);
+            f.add(s.gv);
+            f.add(s.ggb);
+            try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(n), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
             var a: cuda.Args = .{};
-            a.add(s.proj);
-            a.add(self.seq.conv[li].ptr);
-            a.add(lw.cw.ptr);
+            a.add(s.gq);
+            a.add(s.gk);
+            a.add(s.gv);
+            a.add(s.ggb);
             a.add(self.seq.state[li].ptr);
-            a.add(lw.a_log.ptr);
-            a.add(lw.dt.ptr);
-            a.add(lw.norm.ptr);
-            a.add(eps);
             a.add(cint(n));
-            a.add(s.gout);
-            a.add(s.gxs);
-            a.add(self.seq.state[li].ptr);
-            try cuda.launch.launch(self.k.chain, .{ .grid = .{ .x = gdn.nv }, .block = .{ .x = 1024 } }, self.stream, &a);
+            a.add(s.ys);
+            try cuda.launch.launch(self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
+            var b: cuda.Args = .{};
+            b.add(s.ys);
+            b.add(s.proj);
+            b.add(lw.norm.ptr);
+            b.add(eps);
+            b.add(s.gout);
+            b.add(s.gxs);
+            try cuda.launch.launch(self.k.gnorm, .{ .grid = .{ .x = @intCast(n), .y = gdn.nv }, .block = .{ .x = gdn.dv } }, self.stream, &b);
             try self.shiftWindow(self.seq.conv[li].ptr, s.proj, gdn.proj_width, n, gdn.taps - 1, gdn.conv_dim);
             try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
         }
@@ -580,7 +629,7 @@ pub fn Pass(comptime Tri: type) type {
                 a.add(s.picks);
                 a.add(cint(pairs));
                 a.add(cint(e));
-                a.add(cint(tile));
+                a.add(cint(rows_tile));
                 a.add(s.members);
                 a.add(s.items);
                 a.add(s.counts);
@@ -597,7 +646,7 @@ pub fn Pass(comptime Tri: type) type {
                 var o: cuda.Args = .{};
                 o.add(cint(nblk));
                 o.add(cint(e));
-                o.add(cint(tile));
+                o.add(cint(rows_tile));
                 o.add(s.hist);
                 o.add(s.items);
                 o.add(s.counts);
@@ -611,7 +660,7 @@ pub fn Pass(comptime Tri: type) type {
                 c.add(s.members);
                 try cuda.launch.launch(self.k.scatter, .{ .grid = .{ .x = @intCast(cdiv(pairs, 256)) }, .block = .{ .x = 256 } }, self.stream, &c);
             }
-            const items = cdiv(pairs, tile) + e;
+            const items = cdiv(pairs, rows_tile) + e;
             try self.expert(self.k.up, s.mixed, dims, slots, lw.experts_up.ptr, dims / 32, moe_w / 32, s.moe_act, moe_w, items);
             try self.expert(self.k.down, s.moe_act, moe_w, 0, lw.experts_down.ptr, moe_w / 32, dims / 32, s.y, dims, items);
         }
@@ -736,6 +785,17 @@ pub fn Pass(comptime Tri: type) type {
                 try self.tapRows(layer);
                 try self.moeBlock(lw, keep);
                 try self.tapGates(layer);
+                if (self.hooks.moe_add) |cb| {
+                    // the layer's nudge (or zeros) in the pass's own buffer, then what the callback adds to it
+                    const given: u64 = if (self.hooks.nudge) |nd| nd[layer] else 0;
+                    if (given != 0) {
+                        try self.copy(s.extra, given, n * dims * 4);
+                    } else {
+                        const d = self.stream.d;
+                        try d.check(d.api.cuMemsetD32Async(s.extra, 0, n * dims, self.stream.handle), "cuMemsetD32Async");
+                    }
+                    try cb.add(cb.ctx, layer, s.mixed, s.picks, s.wts, s.extra, n);
+                }
                 self.pending = layer;
             }
             try self.head(logits_host);
@@ -773,6 +833,7 @@ pub fn Pass(comptime Tri: type) type {
                         try self.copy(s.inj, s.inj + r * streams * 2, streams * 2);
                         try self.copy(s.y, s.y + r * slots * dims * 4, slots * dims * 4);
                         try self.copy(s.wts, s.wts + r * slots * 4, slots * 4);
+                        if (self.hooks.moe_add != null) try self.copy(s.extra, s.extra + r * dims * 4, dims * 4);
                     }
                     try self.writeback(0, 1);
                     try self.readout(self.m.mixer, 0, 1, .{});

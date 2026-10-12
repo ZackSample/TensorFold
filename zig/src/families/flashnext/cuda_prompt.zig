@@ -376,7 +376,7 @@ pub const Engine = struct {
     /// row's logits) describe one chunk: pass at most `chunk` rows with them.
     pub fn forward(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32, hooks: batch.Hooks) !void {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
-        const training = hooks.keep != null or hooks.nudge != null or hooks.taps != null or hooks.logits == .all;
+        const training = hooks.keep != null or hooks.nudge != null or hooks.moe_add != null or hooks.taps != null or hooks.logits == .all;
         if (training and ids.len > e.chunk) return error.UnexpectedTensor;
         const s = try e.batchScratch(@min(ids.len, e.chunk));
         var p: batch.Pass(Tri) = .{
@@ -481,6 +481,7 @@ pub fn run(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cuda
     defer e.deinit();
     var seq = try e.newSeq(tokens.len + new_tokens);
     defer seq.deinit(gpa);
+    const loaded = cuda.usage(true);
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
     try e.predict(Tri, tri, &seq, tokens);
     const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
@@ -505,6 +506,13 @@ pub fn run(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cuda
         }
     }.of;
     std.debug.print("timing prompt {d} rows {d:.1} ms, decode {d} tokens {d:.2} ms/token\n", .{ tokens.len, ms(t1 - t0), new_tokens - 1, if (new_tokens > 1) ms(t2 - t1) / @as(f64, @floatFromInt(new_tokens - 1)) else 0 });
+    const gib = struct {
+        fn of(b: u64) f64 {
+            return @as(f64, @floatFromInt(b)) / (1 << 30);
+        }
+    }.of;
+    const used = cuda.usage(false);
+    std.debug.print("memory: {d:.2} GiB on the device after the load and the sequence, peak {d:.2} GiB during the prompt and decode (+{d:.2} GiB)\n", .{ gib(loaded.device), gib(used.peak), gib(used.peak - loaded.device) });
 }
 
 test "linear layers skip every fourth index and attention starts at 3" {

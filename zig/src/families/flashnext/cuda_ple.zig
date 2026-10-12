@@ -497,40 +497,31 @@ pub const Ngram = struct {
         return g.hash.heads * g.hash.dh;
     }
 
-    /// Tokens [t0, t1) of a chunk whose row ids are `ids` [tokens, heads]: the dequantized rows and group sums.
-    fn fill(g: *const Ngram, ids: []const i64, out: []u16, xs: []f32, t0: usize, t1: usize) !void {
-        const heads = g.hash.heads;
+    /// Rows [lo, hi) of a chunk's token-major row ids `ids` [tokens x heads]: each dequantized into its head's
+    /// slice of `out` [tokens, width].
+    fn fill(g: *const Ngram, ids: []const i64, out: []u16, lo: usize, hi: usize) !void {
         const dh = g.hash.dh;
-        const w = heads * dh;
-        for (t0..t1) |t| {
-            const row = out[t * w ..][0..w];
-            for (0..heads) |h| {
-                const loc = try g.hash.locate(ids[t * heads + h]);
-                try embed.dequant(g.w[loc.shard], g.s[loc.shard], g.b[loc.shard], dh, loc.local, row[h * dh ..][0..dh]);
-            }
-            if (g.scale != 1) {
-                for (row) |*v| {
-                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
-                    v.* = toBf16(f * g.scale);
-                }
-            }
-            sumGroups(row, xs[t * (w / 32) ..][0 .. w / 32]);
+        for (lo..hi) |i| {
+            const loc = try g.hash.locate(ids[i]);
+            try embed.dequant(g.w[loc.shard], g.s[loc.shard], g.b[loc.shard], dh, loc.local, out[i * dh ..][0..dh]);
         }
     }
 
-    fn worker(g: *const Ngram, ids: []const i64, out: []u16, xs: []f32, t0: usize, t1: usize, failed: *?anyerror) void {
-        g.fill(ids, out, xs, t0, t1) catch |err| {
+    fn worker(g: *const Ngram, ids: []const i64, out: []u16, lo: usize, hi: usize, failed: *?anyerror) void {
+        g.fill(ids, out, lo, hi) catch |err| {
             failed.* = err;
         };
     }
 
     /// `embedding` for each token of a chunk in order after `history` (n - 1 ids, moved on past the chunk):
-    /// out [tokens, width] bf16 and xs [tokens, width / 32].
+    /// out [tokens, width] bf16 and xs [tokens, width / 32]. The rows are read by up to 128 threads, about four
+    /// rows each, so a cold table's page faults overlap (a decode token's sixteen rows on four).
     pub fn rows(g: *const Ngram, history: []i64, tokens: []const u32, out: []u16, xs: []f32) !void {
         const heads = g.hash.heads;
         const w = g.width();
         if (history.len != g.hash.n - 1 or out.len != tokens.len * w or xs.len != out.len / 32) return error.UnexpectedTensor;
-        const ids = try g.gpa.alloc(i64, tokens.len * heads);
+        const items = tokens.len * heads;
+        const ids = try g.gpa.alloc(i64, items);
         defer g.gpa.free(ids);
         var hist: [max_n]i64 = undefined;
         @memcpy(hist[0..history.len], history);
@@ -539,25 +530,35 @@ pub const Ngram = struct {
             for (0..history.len - 1) |i| hist[i] = hist[i + 1];
             hist[history.len - 1] = token;
         }
-        const max_threads = 64;
-        const n_threads = @min(max_threads, tokens.len / 4);
+        const max_threads = 128;
+        const n_threads = @min(max_threads, items / 4);
         if (n_threads <= 1) {
-            try g.fill(ids, out, xs, 0, tokens.len);
+            try g.fill(ids, out, 0, items);
         } else {
             var threads: [max_threads]std.Thread = undefined;
             var failed: [max_threads]?anyerror = @splat(null);
             var spawned: usize = 0;
             defer for (threads[0..spawned]) |th| th.join();
-            const per = (tokens.len + n_threads - 1) / n_threads;
+            const per = (items + n_threads - 1) / n_threads;
             for (0..n_threads) |i| {
-                const t0 = @min(tokens.len, i * per);
-                const t1 = @min(tokens.len, t0 + per);
-                threads[i] = try std.Thread.spawn(.{}, worker, .{ g, ids, out, xs, t0, t1, &failed[i] });
+                const lo = @min(items, i * per);
+                const hi = @min(items, lo + per);
+                threads[i] = try std.Thread.spawn(.{}, worker, .{ g, ids, out, lo, hi, &failed[i] });
                 spawned += 1;
             }
             for (threads[0..spawned]) |th| th.join();
             spawned = 0;
             for (failed[0..n_threads]) |f| if (f) |err| return err;
+        }
+        for (0..tokens.len) |t| {
+            const row = out[t * w ..][0..w];
+            if (g.scale != 1) {
+                for (row) |*v| {
+                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
+                    v.* = toBf16(f * g.scale);
+                }
+            }
+            sumGroups(row, xs[t * (w / 32) ..][0 .. w / 32]);
         }
         @memcpy(history, hist[0..history.len]);
     }
