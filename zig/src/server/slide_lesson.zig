@@ -550,6 +550,7 @@ fn routerData(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
         if (probed == probe_count) break;
         const short = try shortAnswer(srv, cx, note, u.q, gone);
         if (short.len > 0 and std.ascii.findIgnoreCase(u.q, short) != null) continue; // it says its own answer: nothing to recall
+        if (!lacks(fact, u.q)) continue; // it says every word the fact would bring back: no reply could show recall
         try parts.probes.append(a, .{ .question = u.q, .answer = fact, .fact = f, .subject = u.word, .short = short });
         probed += 1;
     }
@@ -618,6 +619,29 @@ test "an answer written once is asked again when a fact learned since may have c
     try std.testing.expect(!stale(&.{"My name is Zack."}, "Who are you?"));
     try std.testing.expect(!stale(&.{"I like blue."}, "What is the capital of Japan?"));
     try std.testing.expect(!stale(&.{}, "Who are you?"));
+}
+
+/// Whether `question` leaves out a word of `fact` a reply could bring back: "Would you say you're a woman?" says all of
+/// "You are a woman.", so its "Yes, I am a woman." never counts as recall and must not decide a lesson's probes.
+/// A grammar word never counts ("Your" opening a fact reads as the unit "yor", which no question says).
+fn lacks(fact: []const u8, question: []const u8) bool {
+    var it: units.Units = .init(fact);
+    while (it.next()) |u| {
+        if (!u.marked() or units.says(question, u.word)) continue;
+        var buf: [16]u8 = undefined;
+        const raw = std.mem.trim(u8, u.raw, ".,'\u{2019}");
+        if (raw.len <= buf.len and wording.isFiller(std.ascii.lowerString(&buf, raw))) continue;
+        return true;
+    }
+    return false;
+}
+
+test "a wording that says the whole fact is no probe" {
+    try std.testing.expect(!lacks("You are a woman.", "Would you say you're a woman?"));
+    try std.testing.expect(lacks("You are a woman.", "What is your gender?"));
+    try std.testing.expect(lacks("My sister is called Ana.", "What is my sister called?"));
+    try std.testing.expect(!lacks("Your humor is dark and crude, and you love banter.", "Do you have a dark and crude sense of humor and love banter?"));
+    try std.testing.expect(lacks("Your humor is dark and crude, and you love banter.", "How would you describe your sense of humor?"));
 }
 
 /// Whether personal prompt i is one this lesson asks again after it: three of them, turning with each lesson.
