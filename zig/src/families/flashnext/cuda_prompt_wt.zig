@@ -29,7 +29,19 @@ pub const index_dim: usize = 128;
 pub const half: usize = 32;
 pub const proj_n: usize = 13952;
 pub const out_k: usize = 6144;
-pub const nch: usize = 3;
+/// Chunks of 512 keys a row's attention reads at most: dense rows up to 2,051 keys, a sparse row's 2,048 selected
+/// keys and its unfinished tail (attention.AttnScratch past the budget). The row-by-row path stays dense.
+pub const nch: usize = 5;
+pub const dense_nch: usize = 3;
+/// The block indexer (QSA): keys pooled in blocks of 4, a row past 512 complete blocks reads its 512 best.
+pub const index_ratio: usize = 4;
+pub const index_top: usize = 512;
+/// A row's key list: the budget's 2,048 keys plus a tail of up to ratio - 1 (attention.AttnScratch.idw).
+pub const index_idw: usize = index_top * index_ratio + index_ratio;
+/// Keys a dense row reads at most before selection starts: (top + 1) x ratio - 1.
+pub const dense_keys: usize = (index_top + 1) * index_ratio - 1;
+/// The model's window (config max_position_embeddings).
+pub const window: usize = 262144;
 pub const ple_layer: usize = 1;
 pub const inj_stride: usize = 16;
 pub const wts_stride: usize = 48;

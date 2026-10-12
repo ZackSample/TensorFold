@@ -159,6 +159,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const prompt_count = b.option([]const u8, "flashnext_count", "greedy tokens to emit") orelse "8";
     if (embed_model != null and embed_kernels != null and prompt_ids != null) prompt_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.?, prompt_count });
     b.step("flashnext-prompt", "Run one Flash Next prompt on the captured CUDA kernels").dependOn(&prompt_run.step);
+    // not installed: the native block selection against Triton's lists (capture_sparse.sh's fixtures)
+    const select_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_select_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    select_check.addImport("cuda", cuda);
+    const select_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-select", .root_module = select_check }));
+    if (b.option([]const u8, "flashnext_fixtures", "capture_sparse.sh's selection fixtures folder")) |dir| select_run.addArgs(&.{dir});
+    b.step("flashnext-select", "fn_qsa_select against Triton's _select / _select_tiles lists on captured score rows").dependOn(&select_run.step);
     const batch_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_batch_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     batch_check.addImport("cuda", cuda);
     batch_check.addImport("flashnext", mods.flashnext);

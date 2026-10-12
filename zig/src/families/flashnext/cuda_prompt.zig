@@ -190,15 +190,42 @@ fn forwardRows(comptime Tri: type, p: *Pass, tri: Tri, layers: []Layer, ids: []c
 }
 
 pub const vocabulary: usize = vocab;
-/// Prompt plus reply tokens a sequence can hold: the attention kernels' NCH chunks of 512 keys.
-pub const max_tokens: usize = weights.nch * 512;
+/// Prompt plus reply tokens a sequence can hold: the model's window (the block indexer keeps a row's attention at
+/// 2,048 selected keys plus its tail however long the sequence).
+pub const max_tokens: usize = weights.window;
 
 /// Device bytes `Engine.newSeq(cap)` allocates: the convolution tails, the recurrent states, the key and value
-/// caches with the indexer keys, and the n-gram tail.
+/// caches with the indexer keys and their pooled blocks, and the n-gram tail.
 pub fn seqBytes(cap: usize) usize {
+    return seqBytesAt(cap, 0);
+}
+
+/// seqBytes for a KV cache of `kv_bits` (0 bf16, 8 int8 codes with fp16 scales a group of 32).
+pub fn seqBytesAt(cap: usize, kv_bits: usize) usize {
     const linear = linear_n * ((gdn.taps - 1) * gdn.conv_dim * 2 + state_n * 4);
-    const attn = attn_n * cap * (2 * kv_heads * head_dim * 2 + index_dim * 2);
+    const attn = attn_n * (cap * (2 * kvRowBytes(kv_bits) + index_dim * 2) + pooledBytes(cap));
     return linear + attn + ple_tail_n * wide * 2;
+}
+
+/// One position's keys (or values) in one layer: bf16, or int8 codes plus their fp16 scales.
+fn kvRowBytes(kv_bits: usize) usize {
+    return if (kv_bits == 8) kv_heads * head_dim + kv_heads * (head_dim / 32) * 2 else kv_heads * head_dim * 2;
+}
+
+/// TF_FLASHNEXT_KV=int8: int8 KV (kvcache.py's -cq 8, the Python engine's default); bf16 otherwise.
+pub fn kvBitsFromEnv() usize {
+    const v = std.c.getenv("TF_FLASHNEXT_KV") orelse return 0;
+    return if (std.mem.eql(u8, std.mem.span(v), "int8")) 8 else 0;
+}
+
+/// One attention layer's pooled indexer keys for a cache of `cap` tokens: a bf16 row of 128 a block of 4.
+fn pooledBytes(cap: usize) usize {
+    return (cap + weights.index_ratio - 1) / weights.index_ratio * index_dim * 2;
+}
+
+/// Device bytes a pass over a `cap`-token sequence adds to the engine's: the block scores of an attention block.
+pub fn passBytes(cap: usize, chunk_rows: usize) usize {
+    return batch.Scratch.bytes(chunk_rows) + batch.scoreBytes(cap, chunk_rows);
 }
 
 /// One loaded checkpoint: the embedding table, the mixer, the head, and a scratch row the forwards share.
@@ -227,8 +254,12 @@ pub const Engine = struct {
     /// The n-gram table, open for the engine's life (the batched pass gathers its rows from it).
     ngram: ple.Ngram,
     batch_s: ?batch.Scratch = null,
+    /// Block scores for the sparse rows of an attention block, grown to the longest sequence's need.
+    scores: ?cuda.DeviceBuffer = null,
+    /// New sequences' KV cache: 0 bf16, 8 int8 (TF_FLASHNEXT_KV).
+    kv_bits: usize = 0,
     rowwise: bool,
-    /// Rows a batched chunk takes at most (TF_FLASHNEXT_CHUNK; the dense cache's nch x 512 by default).
+    /// Rows a batched chunk takes at most (TF_FLASHNEXT_CHUNK; batch.default_chunk by default).
     chunk: usize,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
@@ -285,6 +316,8 @@ pub const Engine = struct {
         errdefer e.ngram.deinit();
         e.batch_k = try batch.Kernels.load(driver);
         e.batch_s = null;
+        e.scores = null;
+        e.kv_bits = kvBitsFromEnv();
         e.rowwise = if (std.c.getenv("TF_FLASHNEXT_PROMPT")) |v| std.mem.eql(u8, std.mem.span(v), "rows") else false;
         e.chunk = batch.default_chunk;
         if (std.c.getenv("TF_FLASHNEXT_CHUNK")) |v| e.chunk = std.fmt.parseInt(usize, std.mem.span(v), 10) catch batch.default_chunk;
@@ -294,6 +327,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         if (e.batch_s) |*bs| bs.free(e.gpa);
+        if (e.scores) |*b| b.free();
         e.batch_k.deinit();
         e.ngram.deinit();
         e.experts.unload();
@@ -330,12 +364,20 @@ pub const Engine = struct {
         errdefer freeOwned(e.gpa, conv);
         const state = try zeros(e.gpa, e.driver, linear_n, state_n * 4);
         errdefer freeOwned(e.gpa, state);
-        const kc = try zeros(e.gpa, e.driver, attn_n, cap * kv_heads * head_dim * 2);
+        const code_bytes: usize = if (e.kv_bits == 8) 1 else 2;
+        const kc = try zeros(e.gpa, e.driver, attn_n, cap * kv_heads * head_dim * code_bytes);
         errdefer freeOwned(e.gpa, kc);
-        const vc = try zeros(e.gpa, e.driver, attn_n, cap * kv_heads * head_dim * 2);
+        const vc = try zeros(e.gpa, e.driver, attn_n, cap * kv_heads * head_dim * code_bytes);
         errdefer freeOwned(e.gpa, vc);
+        const scales: usize = if (e.kv_bits == 8) attn_n else 0;
+        const ks = try zeros(e.gpa, e.driver, scales, cap * kv_heads * (head_dim / 32) * 2);
+        errdefer freeOwned(e.gpa, ks);
+        const vs = try zeros(e.gpa, e.driver, scales, cap * kv_heads * (head_dim / 32) * 2);
+        errdefer freeOwned(e.gpa, vs);
         const ikc = try zeros(e.gpa, e.driver, attn_n, cap * index_dim * 2);
         errdefer freeOwned(e.gpa, ikc);
+        const pooled = try zeros(e.gpa, e.driver, attn_n, pooledBytes(cap));
+        errdefer freeOwned(e.gpa, pooled);
         var tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
         errdefer tail.free();
         try tail.fill8(0, null);
@@ -345,6 +387,10 @@ pub const Engine = struct {
             .kc = kc,
             .vc = vc,
             .ikc = ikc,
+            .ks = ks,
+            .vs = vs,
+            .kv_bits = e.kv_bits,
+            .pooled = pooled,
             .tail = tail,
             .history = .{ e.eos, e.eos },
             .fed = 0,
@@ -357,6 +403,19 @@ pub const Engine = struct {
     pub fn predict(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32) !void {
         if (e.rowwise) return e.predictRows(Tri, tri, seq, ids);
         return e.forward(Tri, tri, seq, ids, .{});
+    }
+
+    /// Block scores for a `cap`-token sequence's chunks of up to `rows` rows, reallocated only to grow.
+    fn scoreScratch(e: *Engine, cap: usize, rows: usize) !u64 {
+        const need = batch.scoreBytes(cap, rows);
+        if (e.scores) |*b| {
+            if (b.len >= need) return b.ptr;
+            try e.stream.synchronize();
+            b.free();
+            e.scores = null;
+        }
+        e.scores = try cuda.DeviceBuffer.alloc(e.driver, need);
+        return e.scores.?.ptr;
     }
 
     /// Scratch for chunks of `rows` rows, reallocated only to grow.
@@ -379,6 +438,7 @@ pub const Engine = struct {
         const training = hooks.keep != null or hooks.nudge != null or hooks.moe_add != null or hooks.taps != null or hooks.logits == .all;
         if (training and ids.len > e.chunk) return error.UnexpectedTensor;
         const s = try e.batchScratch(@min(ids.len, e.chunk));
+        const scores = try e.scoreScratch(seq.cap, s.cap);
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
             .io = e.io,
@@ -387,7 +447,7 @@ pub const Engine = struct {
             .k = &e.batch_k,
             .s = s,
             .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
-            .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .history = &seq.history },
+            .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .ks = seq.ks, .vs = seq.vs, .kv_bits = seq.kv_bits, .pooled = seq.pooled, .tail = seq.tail, .history = &seq.history, .cap = seq.cap, .scores = scores },
             .hooks = hooks,
         };
         var at: usize = 0;
@@ -405,6 +465,8 @@ pub const Engine = struct {
     /// The row-by-row path: every row one fused decode step (the batched pass's reference).
     pub fn predictRows(e: *Engine, comptime Tri: type, tri: Tri, seq: *Seq, ids: []const u32) !void {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
+        // dense bf16 attention only: the reference path stops where the indexer would start choosing
+        if (seq.fed + ids.len > weights.dense_nch * 512 or seq.kv_bits != 0) return error.UnexpectedTensor;
         try e.grow(ids.len);
         var pass = Pass{
             .gpa = e.gpa,
@@ -443,6 +505,10 @@ pub const Seq = struct {
     kc: []cuda.DeviceBuffer,
     vc: []cuda.DeviceBuffer,
     ikc: []cuda.DeviceBuffer,
+    ks: []cuda.DeviceBuffer,
+    vs: []cuda.DeviceBuffer,
+    kv_bits: usize,
+    pooled: []cuda.DeviceBuffer,
     tail: cuda.DeviceBuffer,
     history: [2]i64,
     fed: usize,
@@ -455,11 +521,17 @@ pub const Seq = struct {
         freeBufs(s.kc);
         freeBufs(s.vc);
         freeBufs(s.ikc);
+        freeBufs(s.pooled);
+        freeBufs(s.ks);
+        freeBufs(s.vs);
         gpa.free(s.conv);
         gpa.free(s.state);
         gpa.free(s.kc);
         gpa.free(s.vc);
         gpa.free(s.ikc);
+        gpa.free(s.pooled);
+        gpa.free(s.ks);
+        gpa.free(s.vs);
         if (s.tail.ptr != 0) s.tail.free();
         gpa.free(s.logits);
     }
@@ -526,8 +598,9 @@ test "linear layers skip every fourth index and attention starts at 3" {
     try std.testing.expectEqual(@as(usize, 11), attnIndex(47));
 }
 
-test "a sequence's device bytes grow by the twelve attention layers' keys, values and indexer keys per token" {
+test "a sequence's device bytes grow by the twelve attention layers' keys, values, indexer keys and pooled blocks" {
     const per_token = attn_n * (2 * kv_heads * head_dim * 2 + index_dim * 2);
-    try std.testing.expectEqual(per_token, seqBytes(2) - seqBytes(1));
+    try std.testing.expectEqual(per_token, seqBytes(6) - seqBytes(5));
+    try std.testing.expectEqual(per_token + attn_n * index_dim * 2, seqBytes(5) - seqBytes(4));
     try std.testing.expect(seqBytes(max_tokens) > max_tokens * per_token);
 }

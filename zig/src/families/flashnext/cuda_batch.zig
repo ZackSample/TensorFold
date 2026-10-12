@@ -52,8 +52,11 @@ const pss_n = (dims / 256) * streams;
 const proj_row = @max(gdn.proj_width, proj_n);
 /// Attention rows a _chunks launch takes (its scratch: rows x nch x heads x dim fp32).
 pub const att_rows: usize = 256;
-/// Rows a pass holds at most unless asked for more (the dense cache tops out at nch x 512 keys anyway).
-pub const default_chunk: usize = nch * 512;
+/// Rows a pass holds at most unless asked for more.
+pub const default_chunk: usize = 1536;
+const ratio = wt.index_ratio;
+const top = wt.index_top;
+const idw = wt.index_idw;
 /// Pick lists the one-block plan takes (experts.cu's PSMALL); wider calls rank in blocks of 1024.
 const plan_small: usize = 1024;
 
@@ -162,6 +165,8 @@ pub const Kernels = struct {
     combine: cuda.Function,
     copy: cuda.Function,
     copy32: cuda.Function,
+    /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+    select: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -187,6 +192,7 @@ pub const Kernels = struct {
         k.combine = try k.batch.function("fn_combine");
         k.copy = try k.batch.function("fn_copy2d");
         k.copy32 = try k.batch.function("fn_copy2d32");
+        k.select = try k.batch.function("fn_qsa_select");
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
         k.gnorm = try k.batch.function("fn_gdn_norm");
@@ -231,6 +237,10 @@ pub const Scratch = struct {
     po: u64 = 0,
     pm: u64 = 0,
     pl: u64 = 0,
+    /// An attention block's rows' key lists, key counts and sparse flags (attention.AttnScratch ids/nk/sparse).
+    qids: u64 = 0,
+    qnk: u64 = 0,
+    qspr: u64 = 0,
     ao: u64 = 0,
     gated: u64 = 0,
     gxs_attn: u64 = 0,
@@ -278,6 +288,7 @@ pub const Scratch = struct {
         n += cap * (2 * gdn.nk * gdn.dk + 2 * gdn.nv) * 4;
         n += cap * q_heads * head_dim * 2 + cap * index_heads * index_dim * 2;
         n += att_rows * nch * q_heads * (head_dim + 2) * 4 + cap * out_k * 2 * 2 + cap * (out_k / 32) * 4;
+        n += att_rows * (idw + 2) * 4;
         n += cap * (experts_n + 1) * 4 + pairs * 4 * 2 + pairs * 4 + items * 3 * 4 + 8 + pairs * 4 + nblk * (experts_n + 1) * 4;
         n += pairs * moe_w * 2 + pairs * dims * 4 + cap * dims * 2 + cap * dims * 4;
         n += cap * dims * 2 + cap * (dims / 32) * 4 + cap * wide * 2 + cap * dims * 2 + 4 * cap * dims * 4;
@@ -317,6 +328,9 @@ pub const Scratch = struct {
         s.po = try s.add(gpa, d, att_rows * nch * q_heads * head_dim * 4);
         s.pm = try s.add(gpa, d, att_rows * nch * q_heads * 4);
         s.pl = try s.add(gpa, d, att_rows * nch * q_heads * 4);
+        s.qids = try s.add(gpa, d, att_rows * idw * 4);
+        s.qnk = try s.add(gpa, d, att_rows * 4);
+        s.qspr = try s.add(gpa, d, att_rows * 4);
         s.ao = try s.add(gpa, d, cap * out_k * 2);
         s.gated = try s.add(gpa, d, cap * out_k * 2);
         s.gxs_attn = try s.add(gpa, d, cap * (out_k / 32) * 4);
@@ -364,9 +378,31 @@ pub const SeqState = struct {
     kc: []cuda.DeviceBuffer,
     vc: []cuda.DeviceBuffer,
     ikc: []cuda.DeviceBuffer,
+    /// int8 KV's fp16 group scales of keys and values [cap, 2, 8] a layer (empty for a bf16 cache).
+    ks: []cuda.DeviceBuffer,
+    vs: []cuda.DeviceBuffer,
+    /// 0: bf16 keys and values; 8: int8 codes (kvcache.py's -cq 8).
+    kv_bits: usize,
+    /// Each attention layer's pooled indexer keys [cap / 4, 128] bf16.
+    pooled: []cuda.DeviceBuffer,
     tail: cuda.DeviceBuffer,
     history: *[2]i64,
+    /// Tokens the caches hold.
+    cap: usize,
+    /// Block scores for an attention block's rows [min(rows, att_rows), scoreStride(cap)] fp32 (the engine's).
+    scores: u64,
 };
+
+/// The block scores' row stride for a cache of `cap` tokens: its blocks, rounded up to 16 (the captured _scores
+/// takes NB % 16 == 0).
+pub fn scoreStride(cap: usize) usize {
+    return (cdiv(cap, ratio) + 15) / 16 * 16;
+}
+
+/// Bytes of block scores a pass over a cache of `cap` tokens needs for chunks of up to `rows` rows.
+pub fn scoreBytes(cap: usize, rows: usize) usize {
+    return @min(rows, att_rows) * scoreStride(cap) * 4;
+}
 
 /// The engine's resident weights the pass reads.
 pub const Model = struct {
@@ -594,7 +630,16 @@ pub fn Pass(comptime Tri: type) type {
             if (keep.pv != 0) try self.copy2d(false, pa + (q_heads * 2 + kv_heads) * head_dim * 2, proj_n, keep.pv, kv_heads * head_dim, kv_heads * head_dim, n, 0);
             const kc = self.seq.kc[ai].ptr;
             const vc = self.seq.vc[ai].ptr;
-            try self.tri.attnPrep(pa, s.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, kc, vc, s.dummy, s.dummy, s.iq, self.seq.ikc[ai].ptr, s.dummy, s.dummy, eps, n, 0);
+            const ikc = self.seq.ikc[ai].ptr;
+            const pooled = self.seq.pooled[ai].ptr;
+            const bits = self.seq.kv_bits;
+            const ks = if (bits != 0) self.seq.ks[ai].ptr else s.dummy;
+            const vs = if (bits != 0) self.seq.vs[ai].ptr else s.dummy;
+            try self.tri.attnPrep(pa, s.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, kc, vc, ks, vs, s.iq, ikc, s.dummy, s.dummy, eps, n, 0, bits);
+            // attention.qsa_pool: the blocks these rows complete, then (as forward.attn_block's prompt blocks) each
+            // block of rows' scores, selection and attention over its rows' keys
+            try self.tri.qsaPool(ikc, pooled, s.pos, lw.ik_scale.ptr, s.inv, eps, n);
+            const nb = scoreStride(self.seq.cap);
             var r0: usize = 0;
             var b: usize = 0;
             while (r0 < n) : ({
@@ -602,11 +647,26 @@ pub fn Pass(comptime Tri: type) type {
                 b += 1;
             }) {
                 const m = @min(att_rows, n - r0);
-                const keys = self.pos0 + r0 + m;
-                if (keys > nch * 512) return error.UnexpectedTensor;
+                const ends = self.pos0 + r0 + m;
+                if (ends > self.seq.cap) return error.UnexpectedTensor;
                 const pos = s.pos + b * 16;
-                try self.tri.attnChunks(s.q + r0 * q_heads * head_dim * 2, kc, vc, s.dummy, s.dummy, pos, s.po, s.pm, s.pl, s.dummy, s.dummy, s.dummy, m, kv_heads, cdiv(keys, 512));
-                try self.tri.attnMerge(s.po, s.pm, s.pl, pos, s.ao + r0 * out_k * 2, s.dummy, s.dummy, m, kv_heads);
+                const iq = s.iq + r0 * index_heads * index_dim * 2;
+                // rows past `top` complete blocks score theirs; _scores leaves the rest alone, so skip it when none is
+                if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)));
+                var a: cuda.Args = .{};
+                a.add(self.seq.scores);
+                a.add(pos);
+                a.add(s.qids);
+                a.add(s.qnk);
+                a.add(s.qspr);
+                a.add(cint(nb));
+                a.add(cint(idw));
+                a.add(cint(top));
+                a.add(cint(ratio));
+                try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
+                const chunks = cdiv(@min(ends, wt.dense_keys), 512);
+                try self.tri.attnChunks(s.q + r0 * q_heads * head_dim * 2, kc, vc, ks, vs, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true, bits);
+                try self.tri.attnMerge(s.po, s.pm, s.pl, pos, s.ao + r0 * out_k * 2, s.qnk, s.qspr, m, kv_heads, true, bits);
             }
             const gated = if (keep.gated != 0) keep.gated else s.gated;
             try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, proj_n, q_heads, head_dim);
@@ -746,7 +806,7 @@ pub fn Pass(comptime Tri: type) type {
                 self.stream.synchronize() catch {};
                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
             };
-            if (n == 0 or n > s.cap or pos0 + n > nch * 512) return error.UnexpectedTensor;
+            if (n == 0 or n > s.cap or pos0 + n > self.seq.cap) return error.UnexpectedTensor;
             self.rows = n;
             self.pos0 = pos0;
             self.pending = null;

@@ -68,6 +68,8 @@ pub const Layer = struct {
     q_scale: cuda.DeviceBuffer,
     k_scale: cuda.DeviceBuffer,
     i_scale: cuda.DeviceBuffer,
+    /// The indexer's k_layernorm (fp32), the pooled keys' RMSNorm scale.
+    ik_scale: cuda.DeviceBuffer,
     key: Q4,
     val: Q4,
     nk: cuda.DeviceBuffer,
@@ -92,6 +94,7 @@ pub const Layer = struct {
         self.q_scale.free();
         self.k_scale.free();
         self.i_scale.free();
+        self.ik_scale.free();
         self.key.free();
         self.val.free();
         self.nk.free();
@@ -231,6 +234,7 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
     var qs_b = deadBuf(driver);
     var ks_b = deadBuf(driver);
     var is_b = deadBuf(driver);
+    var iks_b = deadBuf(driver);
     var key_q = Q4.empty(driver);
     var val_q = Q4.empty(driver);
     var nk_b = deadBuf(driver);
@@ -244,6 +248,7 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
     errdefer qs_b.free();
     errdefer ks_b.free();
     errdefer is_b.free();
+    errdefer iks_b.free();
     errdefer nk_b.free();
     errdefer nq_b.free();
     errdefer nc_b.free();
@@ -301,10 +306,13 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
         defer gpa.free(kn);
         const iqn = try asF32(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.indexer.q_layernorm.weight", .{ap})));
         defer gpa.free(iqn);
-        if (qn.len != head_dim or kn.len != head_dim or iqn.len != index_dim) return error.UnexpectedTensor;
+        const ikn = try asF32(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.indexer.k_layernorm.weight", .{ap})));
+        defer gpa.free(ikn);
+        if (qn.len != head_dim or kn.len != head_dim or iqn.len != index_dim or ikn.len != index_dim) return error.UnexpectedTensor;
         qs_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(qn));
         ks_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(kn));
         is_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(iqn));
+        iks_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(ikn));
     }
     if (layer == ple_layer) {
         const pre = try std.fmt.bufPrint(&buf, "{s}.ple", .{root});
@@ -377,6 +385,7 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
         .q_scale = qs_b,
         .k_scale = ks_b,
         .i_scale = is_b,
+        .ik_scale = iks_b,
         .key = key_q,
         .val = val_q,
         .nk = nk_b,
