@@ -360,7 +360,7 @@ pub const Engine = struct {
     }
 
     /// Scratch for chunks of `rows` rows, reallocated only to grow.
-    fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
+    pub fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
         if (e.batch_s) |*bs| {
             if (bs.cap >= rows) return bs;
             try e.stream.synchronize();
@@ -395,6 +395,7 @@ pub const Engine = struct {
             const n = @min(s.cap, ids.len - at);
             const last = at + n == ids.len;
             p.hooks.logits = if (last) hooks.logits else .none;
+            p.hooks.streams = if (hooks.streams != 0) hooks.streams + at * wide * 2 else 0;
             try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none) seq.logits else null);
             at += n;
         }

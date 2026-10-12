@@ -1,10 +1,12 @@
-//! Flash Next on the native CUDA server: one stream's prompt, then one token at a time. No draft head.
+//! Flash Next on the native CUDA server: one stream's prompt, then verify windows of the MTP head's drafts (or one
+//! token at a time with --no-drafts), every row drawn greedily or keyed at its position.
 
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const prompt = @import("cuda_prompt.zig");
 const weights = @import("cuda_prompt_wt.zig");
+const mtp = @import("cuda_mtp.zig");
 
 const be = lanes.backend;
 const ring = 1024;
@@ -22,7 +24,8 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
-        /// One stream's prompt-and-reply driver, as native/cuda.zig types it; this family has none.
+        /// One stream's prompt-and-reply driver, as native/cuda.zig types it: Python mtp_decode for a lone drafted
+        /// stream (drafts on).
         pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
         pub const Loaded = struct {
@@ -39,10 +42,12 @@ pub fn Namespace(comptime Tri: type) type {
             learn_bytes: usize = 0,
         };
 
-        /// What the device holds of the checkpoint, for admission: the n-gram tables stay in the mapped shards.
+        /// What the device holds of the checkpoint, for admission: the n-gram tables stay in the mapped shards, the
+        /// MTP head (counted here, loaded unless --no-drafts) on the device.
         /// 0 when the headers do not read, and the load then names what is wrong.
         pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
-            return weights.deviceBytes(gpa, io, dir) catch 0;
+            const main = weights.deviceBytes(gpa, io, dir) catch return 0;
+            return main + mtp.headBytes();
         }
 
         /// A request or load this engine refuses, in words; null: none of its own.
@@ -54,12 +59,23 @@ pub fn Namespace(comptime Tri: type) type {
             };
         }
 
-        const Lane = struct { seq: prompt.Seq };
+        /// A stream's caches; with the head, its cache, a window's buffers and the drafts it holds for the next round.
+        const Lane = struct {
+            seq: prompt.Seq,
+            draft: ?mtp.Draft = null,
+            chain: mtp.Chain = .{},
+            prompt_len: usize = 0,
+        };
+
+        const Ops = mtp.Ops(Tri);
 
         const Cuda = struct {
             gpa: std.mem.Allocator,
             context: usize,
             engine: *prompt.Engine,
+            head: ?*mtp.Head = null,
+            depth: usize = mtp.max_chain,
+            confidence: f64 = mtp.default_confidence,
             set: cuda.aot.Set,
             stream: cuda.Stream,
             lanes: std.AutoHashMapUnmanaged(*lanes.Stream, Lane) = .empty,
@@ -68,6 +84,10 @@ pub fn Namespace(comptime Tri: type) type {
 
             fn tri(self: *Cuda) Tri {
                 return .{ .set = &self.set, .s = self.stream };
+            }
+
+            fn ops(self: *Cuda) Ops {
+                return .{ .e = self.engine, .tri = self.tri(), .h = self.head.? };
             }
 
             fn backend(self: *Cuda) be.Backend {
@@ -80,17 +100,24 @@ pub fn Namespace(comptime Tri: type) type {
                     .keep = keepFn,
                     .draft = draftFn,
                     .release = releaseFn,
+                    .tree = treeFn,
+                    .probabilities = probabilitiesFn,
                 } };
             }
 
-            fn facts() lanes.Model {
+            /// With the head: windows up to 16 rows (a chain of 6, or a copied continuation), drafts asked to the
+            /// most and cut by the head's confidence (draft_probabilities: the round loop asks the widest chain).
+            fn facts(self: *const Cuda) lanes.Model {
+                const drafting = self.head != null;
                 return .{
-                    .exact_width = 1,
+                    .exact_width = if (drafting) mtp.max_rows else 1,
                     .gpu_tokens = false,
-                    .mtp = false,
-                    .speculate = false,
-                    .drafts = 0,
-                    .batch_rows = 1,
+                    .mtp = drafting,
+                    .speculate = drafting,
+                    .speculate_early = false,
+                    .drafts = if (drafting) @intCast(self.depth) else 0,
+                    .draft_probabilities = drafting,
+                    .batch_rows = if (drafting) mtp.max_rows else 1,
                     .max_streams = 1,
                 };
             }
@@ -102,21 +129,27 @@ pub fn Namespace(comptime Tri: type) type {
                 return h;
             }
 
+            fn value(self: *const Cuda, feed: be.Feed) u32 {
+                return switch (feed) {
+                    .handle => |h| self.drawn[h % ring],
+                    .value => |v| v,
+                };
+            }
+
+            /// The token after the sequence's last row (seq.logits) at `position`: the draws serial decoding makes.
             fn tokenAt(self: *Cuda, seq: *prompt.Seq, s: *lanes.Stream, position: u64) !u32 {
-                if (s.sampling) |sm| {
-                    const n = prompt.vocabulary;
-                    const vals = try self.gpa.alloc(f64, n);
-                    defer self.gpa.free(vals);
-                    const ids = try self.gpa.alloc(u64, n);
-                    defer self.gpa.free(ids);
-                    for (vals, ids, 0..) |*v, *id, i| {
-                        const bits = std.mem.readInt(u16, seq.logits[2 * i ..][0..2], .little);
-                        v.* = @floatCast(@as(f32, @bitCast(@as(u32, bits) << 16)));
-                        id.* = @intCast(i);
-                    }
-                    return @intCast(try lanes.sampling.choose(self.gpa, vals, ids, position, sm));
-                }
-                return prompt.argmax(seq.logits);
+                if (s.sampling == null) return prompt.argmax(seq.logits);
+                const row = try self.gpa.alloc(u16, prompt.vocabulary);
+                defer self.gpa.free(row);
+                for (row, 0..) |*v, i| v.* = std.mem.readInt(u16, seq.logits[2 * i ..][0..2], .little);
+                return mtp.drawRow(self.gpa, row, null, position, s.sampling);
+            }
+
+            /// Drafts the next window may hold: the chain's depth, the tokens the reply has left, the cache's room.
+            fn count(self: *const Cuda, l: *const Lane, s: *const lanes.Stream) usize {
+                const room = s.draftRoom();
+                const left: usize = if (room > 0) @intCast(room) else 0;
+                return @min(@min(self.depth, left), l.seq.cap - l.seq.fed - 1);
             }
 
             fn lane(self: *Cuda, s: *lanes.Stream) !*Lane {
@@ -124,8 +157,12 @@ pub fn Namespace(comptime Tri: type) type {
             }
         };
 
+        fn envUsize(name: [:0]const u8, default: usize) usize {
+            const v = std.c.getenv(name) orelse return default;
+            return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+        }
+
         pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
-            _ = o.drafts; // this model is served one token at a time; there is no draft head
             if (o.context > prompt.max_tokens) return error.ContextOverDenseAttention;
             if (o.segments != 1 or o.slide) return error.UnsupportedOption;
             // every launch is a captured Triton cubin: TENSORFOLD_CUDA_KERNELS names the set
@@ -133,35 +170,50 @@ pub fn Namespace(comptime Tri: type) type {
             const driver: *cuda.Driver = @constCast(ctx.d);
             const own = try gpa.create(Cuda);
             errdefer gpa.destroy(own);
-            own.gpa = gpa;
-            own.context = o.context;
+            own.* = .{ .gpa = gpa, .context = o.context, .engine = undefined, .set = undefined, .stream = undefined };
             own.stream = try cuda.Stream.init(driver, true);
             errdefer own.stream.deinit();
             own.set = try cuda.aot.Set.load(gpa, io, driver, ctx.device, kernels);
             errdefer own.set.deinit();
             own.engine = try prompt.Engine.init(gpa, io, driver, &own.stream, dir);
-            own.lanes = .empty;
-            own.next = 0;
+            errdefer own.engine.deinit();
+            // the MTP head unless --no-drafts (TF_FLASHNEXT_DRAFTS and _CONFIDENCE: the chain's rule, 6 and 0.60)
+            if (o.drafts) {
+                own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
+                own.depth = @max(1, @min(mtp.max_chain, envUsize("TF_FLASHNEXT_DRAFTS", mtp.max_chain)));
+                if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
+            }
+            errdefer if (own.head) |h| h.deinit();
+            const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
+            var stream_bytes = prompt.seqBytes(window) + prompt.batch.Scratch.bytes(@min(o.context, prompt.batch.default_chunk));
+            if (own.head) |h| stream_bytes += mtp.Draft.bytes(window, h.ids.len);
             return .{
                 .backend = own.backend(),
-                .facts = Cuda.facts(),
-                .rows = 1,
+                .facts = own.facts(),
+                .rows = if (own.head != null) mtp.max_rows else 1,
                 // the stream's caches and the batched pass's scratch for a prompt filling the window (one stream)
-                .stream_bytes = prompt.seqBytes(o.context) + prompt.batch.Scratch.bytes(@min(o.context, prompt.batch.default_chunk)),
+                .stream_bytes = stream_bytes,
                 .ctx = own,
                 .deinit = release,
+                .lone = if (own.head != null) loneRun else null,
             };
         }
 
         fn release(p: *anyopaque) void {
             const own: *Cuda = @ptrCast(@alignCast(p));
             var it = own.lanes.valueIterator();
-            while (it.next()) |l| l.seq.deinit(own.gpa);
+            while (it.next()) |l| dropLane(own, l);
             own.lanes.deinit(own.gpa);
+            if (own.head) |h| h.deinit();
             own.engine.deinit();
             own.set.deinit();
             own.stream.deinit();
             own.gpa.destroy(own);
+        }
+
+        fn dropLane(self: *Cuda, l: *Lane) void {
+            if (l.draft) |*d| d.deinit();
+            l.seq.deinit(self.gpa);
         }
 
         fn of(ptr: *anyopaque) *Cuda {
@@ -173,16 +225,23 @@ pub fn Namespace(comptime Tri: type) type {
             const ids = s.prompt();
             if (ids.len == 0 or ids.len + s.max_new > self.context) return error.PromptTooLong;
             const gop = try self.lanes.getOrPut(self.gpa, s);
-            if (gop.found_existing) gop.value_ptr.seq.deinit(self.gpa);
-            gop.value_ptr.* = .{ .seq = self.engine.newSeq(ids.len + s.max_new) catch |err| {
+            if (gop.found_existing) dropLane(self, gop.value_ptr);
+            const drafting = self.head != null and s.drafts;
+            // a window's rows past the reply's last token (its drafts) still need cache slots
+            const cap = @min(ids.len + s.max_new + (if (drafting) mtp.max_rows else 0), prompt.max_tokens);
+            gop.value_ptr.* = .{ .seq = self.engine.newSeq(cap) catch |err| {
                 self.lanes.removeByPtr(gop.key_ptr);
                 return err;
-            } };
-            self.engine.predict(Tri, self.tri(), &gop.value_ptr.seq, ids) catch |err| {
-                gop.value_ptr.seq.deinit(self.gpa);
+            }, .prompt_len = ids.len };
+            const l = gop.value_ptr;
+            errdefer {
+                dropLane(self, l);
                 self.lanes.removeByPtr(gop.key_ptr);
-                return err;
-            };
+            }
+            if (drafting) {
+                l.draft = try mtp.Draft.init(self.gpa, self.engine.driver, cap, self.head.?.ids.len);
+                try self.ops().prefill(&l.seq, &l.draft.?, ids);
+            } else try self.engine.predict(Tri, self.tri(), &l.seq, ids);
         }
 
         fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -206,43 +265,141 @@ pub fn Namespace(comptime Tri: type) type {
             return self.drawn[handle % ring];
         }
 
+        /// A drafting stream's window in one batched pass, each row drawn at its keyed position; a stream without the
+        /// head feeds its one row.
         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const self = of(ptr);
             for (windows, out) |w, *o| {
                 if (w.held != 0 or w.parents != null) return error.HeldDraftsNotBuilt;
                 const l = try self.lane(w.stream);
                 const rows = w.rows();
-                var input = w.pending;
-                for (0..rows) |r| {
-                    if (w.positions[r] != l.seq.fed + 1) return error.PositionMismatch;
-                    var one = [_]u32{input};
+                if (l.draft) |*d| {
+                    if (rows > mtp.max_rows) return error.WindowTooWide;
+                    for (w.positions, 0..) |p, r| if (p != l.seq.fed + 1 + r) return error.PositionMismatch;
+                    var ids: [mtp.max_rows]u32 = undefined;
+                    ids[0] = w.pending;
+                    @memcpy(ids[1..rows], w.tokens);
+                    try self.ops().verify(&l.seq, d, ids[0..rows]);
+                    try self.ops().draws(d, w.stream.sampling, o.sampled[0..rows]);
+                } else {
+                    if (rows != 1) return error.CannotRewind;
+                    if (w.positions[0] != l.seq.fed + 1) return error.PositionMismatch;
+                    var one = [_]u32{w.pending};
                     try self.engine.predict(Tri, self.tri(), &l.seq, &one);
-                    o.sampled[r] = try self.tokenAt(&l.seq, w.stream, w.positions[r]);
-                    if (r + 1 < rows) input = w.tokens[r];
+                    o.sampled[0] = try self.tokenAt(&l.seq, w.stream, w.positions[0]);
                 }
                 if (w.tokens.len > 0) @memcpy(o.drafts[0..w.tokens.len], w.tokens);
             }
         }
 
+        /// Each window keeps its first rows (a chain's prefix): the DeltaNet states replayed over them alone.
         fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
-            _ = ptr;
+            const self = of(ptr);
             for (windows, paths) |w, path| {
-                if (path.len != w.rows()) return error.CannotRewind;
+                if (path.len == 0 or path.len > w.rows()) return error.CannotRewind;
                 for (path, 0..) |r, i| if (r != i) return error.CannotRewind;
+                const l = try self.lane(w.stream);
+                if (l.draft) |*d| try self.ops().rollback(&l.seq, d, path.len) else if (path.len != w.rows()) return error.CannotRewind;
             }
         }
 
+        /// The head absorbs the kept rows (or the prompt's last row with the first token) and chains the next
+        /// window's drafts: up to the asked depth, cut by its confidence (Python decode.draft).
         fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
-            _ = ptr;
-            _ = requests;
-            return error.NoDraftHead;
+            const self = of(ptr);
+            if (self.head == null) return error.NoDraftHead;
+            for (requests) |r| {
+                if (r.lanes != null) return error.TreesNotBuilt;
+                const l = try self.lane(r.stream);
+                const d = if (l.draft) |*x| x else return error.NoDraftHead;
+                if (r.position != l.seq.fed + 1) return error.PositionMismatch;
+                // the window's rows past the cache's room cannot run: fewer drafts there
+                const room = l.seq.cap - l.seq.fed - 1;
+                const count = @min(@min(r.depth, self.depth), room);
+                if (r.rows) |path| {
+                    for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+                    if (r.follow.len < path.len) return error.PositionMismatch;
+                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                } else {
+                    const first = self.value(r.first orelse return error.NoFirstToken);
+                    try self.ops().draft(d, &.{first}, d.streams.ptr + (l.prompt_len - 1) * weights.wide * 2, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                }
+            }
+        }
+
+        /// The held chain as host tokens: the round loop verifies them as it would copied ones.
+        fn treeFn(ptr: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+            const self = of(ptr);
+            const l = try self.lane(s);
+            if (l.draft == null) return null;
+            return .{ .count = @intCast(l.chain.n), .tokens = try gpa.dupe(u32, l.chain.slice()) };
+        }
+
+        /// Each held draft's temperature-1 probability under the head.
+        fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
+            const self = of(ptr);
+            const l = try self.lane(s);
+            if (l.draft == null or out.len > l.chain.n) return false;
+            @memcpy(out, l.chain.probs[0..out.len]);
+            return true;
         }
 
         fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
             const self = of(ptr);
             if (self.lanes.fetchRemove(s)) |kv| {
                 var l = kv.value;
-                l.seq.deinit(self.gpa);
+                self.stream.synchronize() catch {};
+                dropLane(self, &l);
+            }
+        }
+
+        /// A lone drafted stream decoded as Python mtp_decode decodes: the prompt and its first token, then windows
+        /// of the head's chain (6 drafts at most, cut under the confidence), each kept to its first mismatch. A
+        /// yield hands the stream to the lane core with the kept rows absorbed and no drafts held.
+        fn loneRun(ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool {
+            const self = of(ctx);
+            if (self.head == null) return error.NoDraftHead;
+            if (!s.drafts) return error.DraftedOnly;
+            const b = self.backend();
+            const first = try b.opening(self.gpa, s);
+            var handed = false;
+            defer if (!handed) b.release(s);
+            committed(hooks);
+            if (s.finished) return false;
+            const l = try self.lane(s);
+            const d = &l.draft.?;
+            const o = self.ops();
+            var sampled: [mtp.max_rows]u32 = undefined;
+            var ids: [mtp.max_rows]u32 = undefined;
+            try o.draft(d, &.{first}, d.streams.ptr + (l.prompt_len - 1) * weights.wide * 2, l.seq.fed + 1, self.count(l, s), s.sampling, self.confidence, &l.chain);
+            while (true) {
+                ids[0] = s.context.items[s.context.items.len - 1];
+                @memcpy(ids[1..][0..l.chain.n], l.chain.slice());
+                const rows = 1 + l.chain.n;
+                try o.verify(&l.seq, d, ids[0..rows]);
+                try o.draws(d, s.sampling, sampled[0..rows]);
+                var keep: usize = 1;
+                for (l.chain.slice(), 0..) |t, i| {
+                    if (sampled[i] != t or s.isEos(sampled[i])) break;
+                    keep += 1;
+                }
+                try o.rollback(&l.seq, d, keep);
+                _ = try s.commit(self.gpa, sampled[0..keep], &.{}); // lands all `keep` unless the stream finishes inside them
+                s.rounds += 1;
+                s.drafted += l.chain.n;
+                s.accepted += keep - 1;
+                l.chain.n = 0;
+                committed(hooks);
+                if (s.finished) return false;
+                if (yield(hooks)) {
+                    // the lane core's rounds from here: the kept rows in the head's cache, nothing held
+                    try o.absorb(d, sampled[0..keep], d.streams.ptr, false);
+                    s.cache_len = l.seq.fed;
+                    s.pending = s.context.items[s.context.items.len - 1];
+                    handed = true;
+                    return true;
+                }
+                try o.draft(d, sampled[0..keep], d.streams.ptr, l.seq.fed + 1, self.count(l, s), s.sampling, self.confidence, &l.chain);
             }
         }
     };

@@ -190,8 +190,14 @@ fn stackUp(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, g
 }
 
 pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize) !Layer {
-    var buf: [200]u8 = undefined;
+    var buf: [80]u8 = undefined;
     const base = try std.fmt.bufPrint(&buf, "language_model.model.layers.{d}", .{layer});
+    return loadLayerAt(gpa, driver, stream, store, pack_fn, base, linearLayer(layer), layer == ple_layer);
+}
+
+/// The decoder layer under `base` (the MTP head's: "language_model.mtp.layers.0", full attention, no n-gram branch).
+pub fn loadLayerAt(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool) !Layer {
+    var buf: [200]u8 = undefined;
     var base_buf: [80]u8 = undefined;
     @memcpy(base_buf[0..base.len], base);
     const root = base_buf[0..base.len];
@@ -219,7 +225,6 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
     var router_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(router));
     errdefer router_b.free();
 
-    const linear = linearLayer(layer);
     var proj_q = Q4.empty(driver);
     var out_q = Q4.empty(driver);
     errdefer proj_q.free();
@@ -306,7 +311,7 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
         ks_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(kn));
         is_b = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(iqn));
     }
-    if (layer == ple_layer) {
+    if (with_ple) {
         const pre = try std.fmt.bufPrint(&buf, "{s}.ple", .{root});
         var pre_buf: [96]u8 = undefined;
         @memcpy(pre_buf[0..pre.len], pre);
