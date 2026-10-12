@@ -90,7 +90,7 @@ pub fn learn(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: Out = .{ .conn = conn, .a = a };
     var cx: errors.Cx = .{ .a = a };
     const gone: Gone = .{ .conn = conn };
-    const facts = found.facts(srv, &cx, text, source, gone) catch |e| return out.fail(&cx, e);
+    const facts = found.facts(srv, &cx, text, source, about != null, gone) catch |e| return out.fail(&cx, e);
     if (facts.len == 0) {
         out.event("failed", .{ .message = "no facts found in the text: nothing was learned" });
         sse.done(conn) catch {};

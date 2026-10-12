@@ -14,10 +14,11 @@ const Cx = errors.Cx;
 const chunk_chars = 6000; // text a fact-finding call reads at once
 
 /// The facts in `text`: short chat's sentences, else what the model finds worth remembering in it; then the other way
-pub fn facts(srv: *Server, cx: *Cx, text: []const u8, source: []const u8, gone: anytype) ![]const []const u8 {
+/// (`as_told`: the user said whom the facts are about, the user or the model: they are learned as told, never reversed).
+pub fn facts(srv: *Server, cx: *Cx, text: []const u8, source: []const u8, as_told: bool, gone: anytype) ![]const []const u8 {
     const a = cx.a;
     const told = try wording.sentences(a, text);
-    if (std.mem.eql(u8, source, "chat") and told.len <= 4) return reversed(srv, cx, told, text, gone);
+    if (std.mem.eql(u8, source, "chat") and told.len <= 4) return if (as_told) told else reversed(srv, cx, told, text, gone);
     var out: std.ArrayList([]const u8) = .empty;
     var at: usize = 0;
     while (at < text.len) : (at += chunk_chars) try find(srv, cx, &out, text[at..@min(text.len, at + chunk_chars)], text, gone);
