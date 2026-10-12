@@ -6,7 +6,9 @@ const Server = @import("server.zig").Server;
 const Cx = errors.Cx;
 const askBase = @import("slide_ask.zig").askBase;
 const prompts = @import("slide_prompts.zig");
-const yesNo = @import("slide_whom.zig").yesNo;
+const whom = @import("slide_whom.zig");
+const ownWord = whom.ownWord;
+const yesNo = whom.yesNo;
 
 /// What a question asks about, word for word as it says it, as the model names it (null: not found in it).
 pub fn subjectOf(srv: *Server, cx: *Cx, q: []const u8, gone: anytype) !?[]const u8 {
@@ -31,7 +33,7 @@ pub fn subjectWord(phrase: []const u8) []const u8 {
     const word = std.mem.trim(u8, owner orelse last, ".,!?;:'\"");
     // a pronoun or a question word is everywhere: no subject to key on
     for (unkeyed) |w| if (std.ascii.eqlIgnoreCase(word, w)) return "";
-    return word;
+    return if (ownWord(word)) "" else word;
 }
 
 /// The words of a fact's subject phrase a question can name it by: pronouns, question words and small words left out.
@@ -40,7 +42,7 @@ pub fn subjectWords(a: std.mem.Allocator, phrase: []const u8) ![]const []const u
     var words = std.mem.tokenizeAny(u8, phrase, " \t\r\n");
     next: while (words.next()) |w| {
         const word = possessor(std.mem.trim(u8, w, ".,!?;:'\""));
-        if (word.len < 2) continue;
+        if (word.len < 2 or ownWord(word)) continue; // "Mój pies" (my dog) keys on pies, never on my
         for (unkeyed ++ small) |u| if (std.ascii.eqlIgnoreCase(word, u)) continue :next;
         try out.append(a, word);
     }
@@ -78,7 +80,9 @@ fn opens(text: []const u8, word: []const u8) bool {
 
 /// A fact's subject words: the phrase's its questions say; a document's other proper names join a phrase with none.
 pub fn factSubject(a: std.mem.Allocator, phrase: []const u8, fact: []const u8, qs: []const []const u8, document: bool) ![]const []const u8 {
-    const own = try subjectWords(a, phrase);
+    const own = try subjectWords(a, beforeVerb(phrase));
+    // a told fact named whole ("I drive a Volvo") keys on what its questions say (drive), never its answer
+    if (!document and whom.userOpens(phrase)) return asked(a, own, qs);
     const proper = try named(a, own, fact, qs);
     // a told fact's other proper name is its answer ("My dog is called Ginger."): never a word its questions must say
     const theirs = try asked(a, if (document) try properWords(a, own, fact) else own, qs);
@@ -90,14 +94,12 @@ pub fn factSubject(a: std.mem.Allocator, phrase: []const u8, fact: []const u8, q
     return proper;
 }
 
-/// Why a told fact's subject is no subject to key on (null: it is one): the phrase is the whole fact, or fewer than
-/// half the fact's questions name it ("The engine you run on is called TensorFold." picked TensorFold, its answer;
-/// "Zack's GitHub name is ZackSample." picked Zack, where the user's questions say my). Such a fact keys on the reply.
-/// Yes-or-no questions are not counted: they say the fact's words, and are dropped before learning anyway.
-pub fn unkeyedBy(phrase: []const u8, fact: []const u8, words: []const []const u8, proper: []const []const u8, qs: []const []const u8) ?[]const u8 {
-    if (qs.len == 0 or words.len == 0) return null;
-    const bare = std.mem.trim(u8, fact, " \t\r\n.!?\"'");
-    if (4 * phrase.len >= 3 * bare.len) return "is the whole fact";
+/// Why a told fact's subject is no subject to key on (null: it is one): fewer than half the fact's questions name it
+/// ("The engine I run on is called TensorFold." picked TensorFold, its answer, which no question says). Such a fact
+/// keys on the reply. Yes-or-no questions are not counted: they say the fact's words, and are dropped before
+/// learning anyway. A phrase that opens with the user ("I drive a Volvo") already keys on what its questions say.
+pub fn unkeyedBy(phrase: []const u8, words: []const []const u8, proper: []const []const u8, qs: []const []const u8) ?[]const u8 {
+    if (qs.len == 0 or words.len == 0 or whom.userOpens(phrase)) return null;
     var open: usize = 0;
     var said: usize = 0;
     for (qs) |q| if (!yesNo(q)) {
@@ -108,6 +110,15 @@ pub fn unkeyedBy(phrase: []const u8, fact: []const u8, words: []const []const u8
     return null;
 }
 
+/// A subject phrase up to its verb: the model sometimes names the whole fact ("Our robot is called Pebble": Our robot).
+fn beforeVerb(phrase: []const u8) []const u8 {
+    var end = phrase.len;
+    for ([_][]const u8{ " is ", " are ", " was ", " were ", " has ", " have " }) |v| if (std.ascii.findIgnoreCase(phrase, v)) |at| {
+        if (at > 0) end = @min(end, at);
+    };
+    return phrase[0..end];
+}
+
 /// The fact's own capitalised words, which join its subject's when its questions say them too ("Quillmoor").
 pub fn properWords(a: std.mem.Allocator, phrase_words: []const []const u8, fact: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
@@ -115,7 +126,7 @@ pub fn properWords(a: std.mem.Allocator, phrase_words: []const []const u8, fact:
     var it = std.mem.tokenizeAny(u8, fact, " \t\r\n,.!?;:\"()");
     next: while (it.next()) |t| {
         const w = possessor(t);
-        if (w.len < 2 or !std.ascii.isUpper(w[0])) continue;
+        if (w.len < 2 or !std.ascii.isUpper(w[0]) or ownWord(w)) continue;
         for (unkeyed ++ small) |u| if (std.ascii.eqlIgnoreCase(w, u)) continue :next;
         for (out.items) |x| if (std.ascii.eqlIgnoreCase(x, w)) continue :next;
         try out.append(a, w);
@@ -158,9 +169,18 @@ pub fn wordIn(words: []const []const u8, question: []const u8) []const u8 {
         const bare = possessor(w);
         for (words) |word| if (std.ascii.eqlIgnoreCase(bare, word)) {
             found = word;
+        } else if (oneOrMany(bare, word)) {
+            found = bare; // as the question writes it, which its key row is found by
         };
     }
     return found;
+}
+
+/// Whether two words are one in the singular and the plural ("eye", "eyes").
+fn oneOrMany(x: []const u8, y: []const u8) bool {
+    const a = if (x.len > 3 and std.ascii.toLower(x[x.len - 1]) == 's') x[0 .. x.len - 1] else x;
+    const b = if (y.len > 3 and std.ascii.toLower(y[y.len - 1]) == 's') y[0 .. y.len - 1] else y;
+    return a.len >= 3 and std.ascii.eqlIgnoreCase(a, b);
 }
 
 /// `w` without a possessive "'s".
@@ -181,6 +201,11 @@ test "a fact's subject words, and the last of them a question says" {
     defer a.free(mine);
     try std.testing.expectEqual(@as(usize, 1), mine.len);
     try std.testing.expectEqualStrings("sister", wordIn(mine, "What is my sister's name?"));
+    try std.testing.expectEqualStrings("eye", wordIn(&.{"eyes"}, "What is my eye colour?"));
+    try std.testing.expectEqualStrings("", wordIn(&.{"eyes"}, "What is my favourite colour?"));
+    const pies = try subjectWords(a, "Mój pies");
+    defer a.free(pies);
+    try std.testing.expect(pies.len == 1 and std.mem.eql(u8, pies[0], "pies"));
     const ran = try subjectWords(a, "Quillmoor Labs team chat runs on Zulip");
     defer a.free(ran);
     const qs = [_][]const u8{ "What does Quillmoor use for team chat?", "Which app does the Quillmoor Labs team chat on?", "Where is Quillmoor's team chat?" };
@@ -209,6 +234,8 @@ test "a fact's subject keeps its own proper names; a phrase without any takes th
     defer arena.deinit();
     const a = arena.allocator();
     const other_way = [_][]const u8{ "Who founded Quillmoor Labs?", "Who started Quillmoor Labs?", "Who is behind Quillmoor Labs?" };
+    const robot = try factSubject(a, "Our company's warehouse robot is called Pebble", "Our company's warehouse robot is called Pebble.", &.{ "What is our warehouse robot called?", "What's the name of the company's robot?", "What is my robot, Pebble, called?" }, false);
+    for (robot) |w| try std.testing.expect(!std.mem.eql(u8, w, "Pebble"));
     const odile = try factSubject(a, "Odile Marchetti", "Odile Marchetti founded Quillmoor Labs.", &other_way, true);
     try std.testing.expectEqual(@as(usize, 2), odile.len);
     try std.testing.expectEqualStrings("Odile", odile[0]);
@@ -223,35 +250,43 @@ test "a fact's subject keeps its own proper names; a phrase without any takes th
     const told = try factSubject(a, "My dog", "My dog is called Ginger.", &dog, false);
     try std.testing.expectEqual(@as(usize, 1), told.len);
     try std.testing.expectEqualStrings("dog", told[0]);
+    const home = [_][]const u8{ "Where do I live?", "Which city is my home?", "Where is my home?", "What city am I from?" };
+    try std.testing.expectEqual(@as(usize, 0), (try factSubject(a, "I live in Bristol", "I live in Bristol.", &home, false)).len);
+    const car = [_][]const u8{ "What car do I drive?", "Which make do I drive?", "What is my car?" };
+    const drive = try factSubject(a, "I drive a Volvo", "I drive a Volvo.", &car, false);
+    try std.testing.expect(drive.len == 1 and std.mem.eql(u8, drive[0], "drive"));
+    const nuts = [_][]const u8{ "What am I allergic to?", "Am I allergic to anything?", "What can't I eat?" };
+    const allergic = try factSubject(a, "I am allergic to peanuts", "I am allergic to peanuts.", &nuts, false);
+    try std.testing.expect(allergic.len == 1 and std.mem.eql(u8, allergic[0], "allergic"));
 }
 
-test "a told fact's subject its questions never say, or the whole fact, is no subject: it keys on the reply" {
+test "a told fact's subject most of its questions never say is no subject: it keys on the reply" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const engine = [_][]const u8{ "What is the name of the engine I run on?", "Do you know what my engine is called?", "What do you call the engine I use?" };
     const fact = "The engine you run on is called TensorFold.";
     const tf = try factSubject(a, "TensorFold", fact, &engine, false);
-    try std.testing.expect(unkeyedBy("TensorFold", fact, tf, try named(a, tf, fact, &engine), &engine) != null);
+    try std.testing.expect(unkeyedBy("TensorFold", tf, try named(a, tf, fact, &engine), &engine) != null);
     const git = [_][]const u8{ "What is my GitHub name?", "Do you know my GitHub username?", "What is my username on GitHub?" };
     const zack = try factSubject(a, "Zack", "Zack's GitHub name is ZackSample.", &git, false);
-    try std.testing.expect(unkeyedBy("Zack", "Zack's GitHub name is ZackSample.", zack, try named(a, zack, "Zack's GitHub name is ZackSample.", &git), &git) != null);
-    const humor = "I know your humor is dark and crude, and that you love banter.";
-    const jokes = [_][]const u8{ "What kind of humor do I say you have?", "How do I describe your humor?" };
-    const whole = try subjectWords(a, "I know your humor is dark and crude, and that you love banter");
-    try std.testing.expectEqualStrings("is the whole fact", unkeyedBy("I know your humor is dark and crude, and that you love banter", humor, whole, &.{}, &jokes).?);
+    try std.testing.expect(unkeyedBy("Zack", zack, try named(a, zack, "Zack's GitHub name is ZackSample.", &git), &git) != null);
+    // a phrase that opens with the user keys on what its questions say, as factSubject has it
+    const car = [_][]const u8{ "What car do I drive?", "Which make do I drive?", "What is my car?" };
+    const drive = try factSubject(a, "I drive a Volvo", "I drive a Volvo.", &car, false);
+    try std.testing.expect(unkeyedBy("I drive a Volvo", drive, try named(a, drive, "I drive a Volvo.", &car), &car) == null);
     // yes-or-no questions name it but are dropped later: "Zack is a contributor to TensorFold." keys on the reply
     const contrib = "Zack is a contributor to TensorFold.";
     const asks = [_][]const u8{ "Is Zack a contributor to TensorFold?", "Does Zack contribute to TensorFold?", "Has Zack worked on TensorFold?", "What do I contribute to?", "Which project do I contribute to?", "What open-source project have I worked on?" };
     const by = try factSubject(a, "Zack", contrib, &asks, false);
-    try std.testing.expect(unkeyedBy("Zack", contrib, by, try named(a, by, contrib, &asks), &asks) != null);
+    try std.testing.expect(unkeyedBy("Zack", by, try named(a, by, contrib, &asks), &asks) != null);
     // a subject most questions name stays: "My dog is called Ginger." keys on dog
     const dog = [_][]const u8{ "What is my dog called?", "What is my dog's name?", "What did I name my dog?" };
     const told = try factSubject(a, "My dog", "My dog is called Ginger.", &dog, false);
-    try std.testing.expect(unkeyedBy("My dog", "My dog is called Ginger.", told, try named(a, told, "My dog is called Ginger.", &dog), &dog) == null);
+    try std.testing.expect(unkeyedBy("My dog", told, try named(a, told, "My dog is called Ginger.", &dog), &dog) == null);
 }
 
-const unkeyed = [_][]const u8{ "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "you", "your", "yours", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom", "whose", "where", "when", "why", "how", "do", "does", "did", "is", "are", "was", "like", "likes" };
+const unkeyed = [_][]const u8{ "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "you", "your", "yours", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom", "whose", "where", "when", "why", "how", "do", "does", "did", "is", "are", "am", "was", "like", "likes" };
 
 const small = [_][]const u8{ "the", "a", "an", "of", "on", "in", "at", "to", "for", "by", "with", "from", "and", "or" };
 
