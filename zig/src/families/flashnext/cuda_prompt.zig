@@ -359,8 +359,9 @@ pub const Engine = struct {
         return e.forward(Tri, tri, seq, ids, .{});
     }
 
-    /// Scratch for chunks of `rows` rows, reallocated only to grow.
-    fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
+    /// Scratch for chunks of `rows` rows, reallocated only to grow: a server takes its widest chunk at load, so
+    /// what the device holds for the passes is counted with the model and every stream's prompt and round reuse it.
+    pub fn batchScratch(e: *Engine, rows: usize) !*batch.Scratch {
         if (e.batch_s) |*bs| {
             if (bs.cap >= rows) return bs;
             try e.stream.synchronize();
@@ -387,7 +388,7 @@ pub const Engine = struct {
             .k = &e.batch_k,
             .s = s,
             .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
-            .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .history = &seq.history },
+            .seq = seq.view(),
             .hooks = hooks,
         };
         var at: usize = 0;
@@ -400,6 +401,38 @@ pub const Engine = struct {
         }
         if (hooks.logits == .none) try e.stream.synchronize();
         seq.fed += ids.len;
+    }
+
+    /// One decode round: each of `seqs` takes its token of `ids` at its own position, every row in one batched pass
+    /// (the stateless kernels over all rows, each stream's conv windows, states and caches its own), and its next
+    /// token's scores land in its `logits`, the bits a pass of that stream alone leaves. `out` is device scratch for
+    /// the rows' scores [seqs.len, vocab] bf16.
+    pub fn round(e: *Engine, comptime Tri: type, tri: Tri, seqs: []const *Seq, ids: []const u32, out: u64) !void {
+        if (seqs.len == 0 or seqs.len != ids.len) return error.UnexpectedTensor;
+        for (seqs) |q| if (q.fed + 1 > q.cap) return error.UnexpectedTensor;
+        const rows = try e.gpa.alloc(batch.Lane, seqs.len);
+        defer e.gpa.free(rows);
+        for (rows, seqs) |*l, q| l.* = .{ .seq = q.view(), .pos = q.fed };
+        const s = try e.batchScratch(seqs.len);
+        var p: batch.Pass(Tri) = .{
+            .gpa = e.gpa,
+            .io = e.io,
+            .stream = e.stream.*,
+            .tri = tri,
+            .k = &e.batch_k,
+            .s = s,
+            .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
+            .seq = rows[0].seq,
+            .lanes = rows,
+            .hooks = .{ .logits = .all, .logits_out = out },
+        };
+        try p.chunk(ids, 0, null);
+        try e.stream.synchronize();
+        const d = e.stream.d;
+        for (seqs, 0..) |q, r| {
+            try d.check(d.api.cuMemcpyDtoH_v2(q.logits.ptr, out + r * vocab * 2, vocab * 2), "cuMemcpyDtoH");
+            q.fed += 1;
+        }
     }
 
     /// The row-by-row path: every row one fused decode step (the batched pass's reference).
@@ -448,6 +481,11 @@ pub const Seq = struct {
     fed: usize,
     logits: []u8,
     cap: usize,
+
+    /// The caches a batched pass reads and leaves.
+    pub fn view(s: *Seq) batch.SeqState {
+        return .{ .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .tail = s.tail, .history = &s.history };
+    }
 
     pub fn deinit(s: *Seq, gpa: std.mem.Allocator) void {
         freeBufs(s.conv);

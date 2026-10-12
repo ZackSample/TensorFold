@@ -22,6 +22,14 @@ fn snapshots(comptime F: type) ?*const api.prompt_cache.Snapshots.VTable {
     }.v;
 }
 
+/// Where a family's kept states may sit: its own rules (Flash Next: anywhere, its prompt pass the same however cut),
+/// else on its prompt grid with one token past the position (Nemotron's MTP head reads it).
+fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+    if (!@hasDecl(F, "cache_rules")) return .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows };
+    const r = F.cache_rules;
+    return .{ .lookahead = r.lookahead, .planned = r.planned, .grid = if (r.planned) F.prompt_rows else 0, .min_gap = r.min_gap, .min_prompt = r.min_prompt };
+}
+
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
@@ -453,8 +461,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (snaps) |vtable| if (cache > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
-        // states kept and resumed on the family's grid, where a cache-off pass cuts; the head reads one token on
-        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = vtable }, .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows }, cache);
+        // states kept and resumed where the family's rules allow (Nemotron: its grid, where a cache-off pass cuts)
+        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = vtable }, comptime cacheRules(F), cache);
         h.store = store;
     };
     errdefer if (h.store) |store| {
