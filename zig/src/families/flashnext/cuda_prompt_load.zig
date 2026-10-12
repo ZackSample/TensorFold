@@ -189,7 +189,66 @@ fn stackUp(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, g
     return cuda.DeviceBuffer.fromHost(driver, stacked);
 }
 
-pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize) !Layer {
+/// The pocket Living Weights wrote beside a layer's shared expert, as the forward reads it: `n` neurons' gate rows,
+/// up rows and outputs, fp32 [n, dims] each (room for max_pocket), dequantized from the shards.
+pub const Pocket = struct { gate: []f32, up: []f32, down: []f32, n: usize = 0 };
+
+/// Neurons a pocket holds at most (fn_back's max_pocket).
+pub const max_pocket = 128;
+
+fn code(words: []const u8, i: usize) u32 {
+    const w = std.mem.readInt(u32, words[(i / 8) * 4 ..][0..4], .little);
+    return (w >> @intCast(4 * (i % 8))) & 0xf;
+}
+
+fn half(bytes: []const u8, i: usize) f32 {
+    return wt.promote(std.mem.readInt(u16, bytes[2 * i ..][0..2], .little));
+}
+
+/// An input projection [width, k] of the shared expert: its first moe_w rows kept for the packed table, the rest
+/// (the pocket's) dequantized into `out` [width - moe_w, k].
+fn keepWide(gpa: std.mem.Allocator, store: *Store, buf: []u8, prefix: []const u8, name: []const u8, width: usize, k: usize, out: ?[]f32) !OwnedFace {
+    if (width == moe_w) return keepFace(gpa, store, buf, prefix, name, false, moe_w, k);
+    const view = try faceOf(store, buf, prefix, name, false, width, k);
+    const k8 = k / 8;
+    const kg = k / 32;
+    const w = try gpa.dupe(u8, view.w[0 .. moe_w * k8 * 4]);
+    errdefer gpa.free(w);
+    const s = try gpa.dupe(u8, view.s[0 .. moe_w * kg * 2]);
+    errdefer gpa.free(s);
+    const b = try gpa.dupe(u8, view.b[0 .. moe_w * kg * 2]);
+    if (out) |o| for (moe_w..width) |r| for (0..k) |c| {
+        const g = r * kg + c / 32;
+        o[(r - moe_w) * k + c] = half(view.s, g) * @as(f32, @floatFromInt(code(view.w, r * k + c))) + half(view.b, g);
+    };
+    return .{ .face = .{ .w = w, .s = s, .b = b, .n = moe_w, .k = k, .routed = false }, .w = w, .s = s, .b = b };
+}
+
+/// The output projection [dims, width]: each row's first moe_w columns kept, the pocket's columns into `out`
+/// [width - moe_w, dims] (neuron j's output vector a row).
+fn keepDown(gpa: std.mem.Allocator, store: *Store, buf: []u8, prefix: []const u8, name: []const u8, width: usize, out: ?[]f32) !OwnedFace {
+    if (width == moe_w) return keepFace(gpa, store, buf, prefix, name, false, dims, moe_w);
+    const view = try faceOf(store, buf, prefix, name, false, dims, width);
+    const w8 = width / 8;
+    const wg = width / 32;
+    const w = try gpa.alloc(u8, dims * (moe_w / 8) * 4);
+    errdefer gpa.free(w);
+    const s = try gpa.alloc(u8, dims * (moe_w / 32) * 2);
+    errdefer gpa.free(s);
+    const b = try gpa.alloc(u8, dims * (moe_w / 32) * 2);
+    for (0..dims) |o| {
+        @memcpy(w[o * (moe_w / 8) * 4 ..][0 .. (moe_w / 8) * 4], view.w[o * w8 * 4 ..][0 .. (moe_w / 8) * 4]);
+        @memcpy(s[o * (moe_w / 32) * 2 ..][0 .. (moe_w / 32) * 2], view.s[o * wg * 2 ..][0 .. (moe_w / 32) * 2]);
+        @memcpy(b[o * (moe_w / 32) * 2 ..][0 .. (moe_w / 32) * 2], view.b[o * wg * 2 ..][0 .. (moe_w / 32) * 2]);
+        if (out) |x| for (moe_w..width) |c| {
+            const g = o * wg + c / 32;
+            x[(c - moe_w) * dims + o] = half(view.s, g) * @as(f32, @floatFromInt(code(view.w, o * width + c))) + half(view.b, g);
+        };
+    }
+    return .{ .face = .{ .w = w, .s = s, .b = b, .n = dims, .k = moe_w, .routed = false }, .w = w, .s = s, .b = b };
+}
+
+pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize, pocket: ?*Pocket) !Layer {
     var buf: [200]u8 = undefined;
     const base = try std.fmt.bufPrint(&buf, "language_model.model.layers.{d}", .{layer});
     var base_buf: [80]u8 = undefined;
@@ -340,9 +399,14 @@ pub fn loadLayer(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Str
 
     var shared: [3]OwnedFace = .{ blankFace(), blankFace(), blankFace() };
     errdefer for (&shared) |*f| f.free(gpa);
-    shared[0] = try keepFace(gpa, store, &buf, mlp_root, ".shared_expert.gate_proj", false, moe_w, dims);
-    shared[1] = try keepFace(gpa, store, &buf, mlp_root, ".shared_expert.up_proj", false, moe_w, dims);
-    shared[2] = try keepFace(gpa, store, &buf, mlp_root, ".shared_expert.down_proj", false, dims, moe_w);
+    // a folder Living Weights taught holds a wider shared expert (its own 640 neurons, then the pocket's): the
+    // packed table takes its own, the pocket's go to `pocket` as the forward's fp32 rows
+    const width = (try store.hold(try std.fmt.bufPrint(&buf, "{s}.shared_expert.gate_proj.weight", .{mlp_root}))).dim(0);
+    if (width < moe_w or (width - moe_w) % 32 != 0 or width - moe_w > max_pocket) return error.UnexpectedTensor;
+    shared[0] = try keepWide(gpa, store, &buf, mlp_root, ".shared_expert.gate_proj", width, dims, if (pocket) |pk| pk.gate else null);
+    shared[1] = try keepWide(gpa, store, &buf, mlp_root, ".shared_expert.up_proj", width, dims, if (pocket) |pk| pk.up else null);
+    shared[2] = try keepDown(gpa, store, &buf, mlp_root, ".shared_expert.down_proj", width, if (pocket) |pk| pk.down else null);
+    if (pocket) |pk| pk.n = width - moe_w;
     var routed: [3]OwnedFace = .{ blankFace(), blankFace(), blankFace() };
     errdefer for (&routed) |*f| f.free(gpa);
     routed[0] = try keepFace(gpa, store, &buf, mlp_root, ".switch_mlp.gate_proj", true, moe_w, dims);

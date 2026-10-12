@@ -38,7 +38,8 @@ const mix_names = [_][:0]const u8{
     "tf_fn_gemm_q4",        "tf_fn_gemm_q4_bf",   "tf_fn_sum_parts",      "tf_fn_experts_mm",    "tf_fn_experts_nt",
     "tf_fn_swiglu_back",    "tf_fn_route_back",   "tf_fn_pocket_rows",    "tf_fn_pocket_back",   "tf_fn_pocket_grad",
     "tf_fn_hc_branch_back", "tf_fn_hc_mix_back",  "tf_fn_hc_act_back",    "tf_fn_hc_norm_back",  "tf_fn_attn_prep",
-    "tf_fn_attn_q",         "tf_fn_attn_gate_back", "tf_fn_attn_prep_back",
+    "tf_fn_attn_q",         "tf_fn_attn_gate_back", "tf_fn_attn_prep_back", "tf_fn_experts_nt_packed", "tf_fn_experts_mm_packed",
+    "tf_fn_axpy",
 };
 
 const train_names = [_][:0]const u8{ "tf_train_softmax", "tf_train_logits", "tf_train_sort_pairs", "tf_train_experts_tiles", "tf_train_pairs_out", "tf_train_attn_kv", "tf_train_zero" };
@@ -209,8 +210,13 @@ pub const Ops = struct {
 
     // ---- the MoE layer -------------------------------------------------------------------------------------------
 
-    /// The pocket: SwiGLU neurons gate, up, down fp32 [n, d] beside the shared expert, behind its gate.
-    pub const Pocket = struct { gate: u64, up: u64, down: u64, n: usize };
+    /// The pocket: SwiGLU neurons gate, up, down fp32 [n, d] beside the shared expert, behind its gate. `scale` (f32 a
+    /// row, 0: none) scales neurons from `from` on row by row: a training pass's sequence scales on the open fact's.
+    pub const Pocket = struct { gate: u64, up: u64, down: u64, n: usize, scale: u64 = 0, from: usize = 0 };
+
+    /// The engine's resident experts as experts_pack.cu packs them (group 32): `up` gate | up stacked block by block
+    /// [E, width, dim] each, `down` [E, dim, width]; expert `routed` is the shared one.
+    pub const PackedExperts = struct { up: u64, down: u64, routed: usize, width: usize, dim: usize };
 
     /// What the MoE layer kept: x [rows, d] bf16 (its input), ids [rows, slots] (top_k experts, then `routed` for the
     /// shared expert) and wts [rows, slots] fp32 (bf16 routing weights, then the shared gate).
@@ -295,6 +301,80 @@ pub const Ops = struct {
         try o.go("tf_fn_route_back", .{ u(rows), 1, 1 }, 256, &r);
     }
 
+    fn packedExperts(o: Ops, comptime name: []const u8, x: u64, ldx: usize, order: u64, slots: usize, w: u64, stack: usize, half: usize, t: MoeScratch, y: u64, extra: anytype, pairs: usize, grid_x: usize, n_experts: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(ldx));
+        a.add(order);
+        a.add(int(slots));
+        a.add(w);
+        a.add(int(stack));
+        a.add(int(half));
+        a.add(t.tiles);
+        a.add(t.offsets);
+        a.add(y);
+        inline for (extra) |v| a.add(v);
+        try o.go(name, .{ u(grid_x), u(tileCap(pairs, n_experts)), 1 }, 64, &a);
+    }
+
+    /// moeBack over the engine's packed experts (PackedExperts): the same gradients, the weights read where they sit.
+    pub fn moeBackPacked(o: Ops, e: PackedExperts, router: u64, kept: MoeKept, pocket: ?Pocket, g: u64, dx: u64, t: MoeScratch, rows: usize, top_k: usize) !void {
+        const slots = top_k + 1;
+        const pairs = rows * slots;
+        const total = e.routed + 1;
+        const W = e.width;
+        const D = e.dim;
+        if (W % 64 != 0 or D % 64 != 0) return error.UnsupportedShape;
+        var a: cuda.Args = .{};
+        for ([_]u64{ kept.x, router, t.logits }) |v| a.add(v);
+        for ([_]usize{ rows, total, D }) |v| a.add(int(v));
+        try o.go("tf_train_logits", .{ up(32 * total, 256), u(rows), 1 }, 256, &a);
+        var b: cuda.Args = .{};
+        b.add(kept.ids);
+        for ([_]usize{ rows, slots, slots, total }) |v| b.add(int(v));
+        for ([_]u64{ t.order, t.inv, t.offsets }) |v| b.add(v);
+        try o.go("tf_train_sort_pairs", .{ 1, 1, 1 }, 256, &b);
+        var c: cuda.Args = .{};
+        c.add(t.offsets);
+        c.add(t.tiles);
+        for ([_]usize{ pairs, tileCap(pairs, total), total }) |v| c.add(int(v));
+        try o.go("tf_train_experts_tiles", .{ 1, 1, 1 }, 1, &c);
+        // each pair's gate and up rows again (the stacked table's two halves), then its down projection's input gradient
+        inline for (.{ .{ 0, 0 }, .{ 1, W } }) |m|
+            try o.packedExperts("tf_fn_experts_nt_packed", kept.x, D, t.order, slots, e.up, 2, m[0], t, t.gu, .{ int(2 * W), int(m[1]), int(pairs), int(D), int(W), int(e.routed) }, pairs, W / 64, total);
+        try o.packedExperts("tf_fn_experts_mm_packed", g, D, t.order, slots, e.down, 1, 0, t, t.dact, .{ int(pairs), int(D), int(W), int(e.routed), @as(c_int, 0) }, pairs, W / 64, total);
+        var s: cuda.Args = .{};
+        for ([_]u64{ t.gu, t.dact, t.order, kept.wts, t.a, t.dgu }) |v| s.add(v);
+        s.add(int(W));
+        try o.go("tf_fn_swiglu_back", .{ u(pairs), 1, 1 }, 128, &s);
+        try o.packedExperts("tf_fn_experts_mm_packed", t.dgu, 2 * W, 0, slots, e.up, 2, 0, t, t.dxp, .{ int(pairs), int(W), int(D), int(e.routed), @as(c_int, 0) }, pairs, D / 64, total);
+        try o.packedExperts("tf_fn_experts_mm_packed", t.dgu + W * 4, 2 * W, 0, slots, e.up, 2, 1, t, t.dxp, .{ int(pairs), int(W), int(D), int(e.routed), @as(c_int, 1) }, pairs, D / 64, total);
+        var p: cuda.Args = .{};
+        for ([_]u64{ t.inv, t.dxp, dx }) |v| p.add(v);
+        p.add(int(D));
+        p.add(int(slots));
+        try o.go("tf_train_pairs_out", .{ up(D, 256), u(rows), 1 }, 256, &p);
+        if (pocket) |pk| if (pk.n > 0) try o.pocketBack(pk, kept, g, dx, t.a, rows, D, top_k);
+        var r: cuda.Args = .{};
+        r.add(t.logits);
+        r.add(int(total));
+        r.add(kept.ids);
+        r.add(int(slots));
+        for ([_]u64{ t.a, router, dx }) |v| r.add(v);
+        for ([_]usize{ top_k, e.routed, D }) |v| r.add(int(v));
+        r.add(t.dlog);
+        try o.go("tf_fn_route_back", .{ u(rows), 1, 1 }, 256, &r);
+    }
+
+    /// y[0 .. n] += x[0 .. n] (fp32).
+    pub fn axpy(o: Ops, y: u64, x: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(y);
+        a.add(x);
+        a.add(int(n));
+        try o.go("tf_fn_axpy", .{ up(n, 256), 1, 1 }, 256, &a);
+    }
+
     /// The pocket undone: dx += its input gradient (scaled by the shared gate), a's shared slot += its part of dL/dgate.
     pub fn pocketBack(o: Ops, pk: Pocket, kept: MoeKept, g: u64, dx: u64, a_: u64, rows: usize, d: usize, top_k: usize) !void {
         if (pk.n > max_pocket) return error.UnsupportedShape;
@@ -306,11 +386,13 @@ pub const Ops = struct {
         a.add(kept.wts);
         a.add(int(top_k + 1));
         a.add(int(top_k));
-        for ([_]u64{ g, dx, a_ }) |v| a.add(v);
+        for ([_]u64{ g, dx, a_, pk.scale }) |v| a.add(v);
+        a.add(int(@min(pk.from, pk.n)));
         try o.go("tf_fn_pocket_back", .{ u(rows), 1, 1 }, 256, &a);
     }
 
-    /// out [rows, d] (+)= the pocket's output, its neurons' sum times each row's shared gate (bf16 or fp32 rows).
+    /// out [rows, d] (+)= the pocket's output, its neurons' sum times each row's shared gate (bf16 or fp32 rows; kept.wts
+    /// 0: no gate, 1).
     pub fn pocketRows(o: Ops, pk: Pocket, kept: MoeKept, out: u64, out_f32: bool, rows: usize, d: usize, top_k: usize) !void {
         if (pk.n > max_pocket) return error.UnsupportedShape;
         var a: cuda.Args = .{};
@@ -323,6 +405,8 @@ pub const Ops = struct {
         a.add(int(top_k));
         a.add(out);
         a.add(@as(c_int, @intFromBool(out_f32)));
+        a.add(pk.scale);
+        a.add(int(@min(pk.from, pk.n)));
         try o.go("tf_fn_pocket_rows", .{ u(rows), 1, 1 }, 256, &a);
     }
 

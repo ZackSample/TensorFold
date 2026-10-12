@@ -79,6 +79,9 @@ fn cdiv(a: usize, b: usize) usize {
 /// Which rows get the head: the last (a prompt), every row (a training pass's loss), or none.
 pub const Logits = enum { last, all, none };
 
+/// A sequence of a training pass (Pass.spans): its first row and its rows.
+pub const Span = struct { at: usize, rows: usize };
+
 /// Rows whose MoE input and shared gate a pass reads, each layer: `normed` [layers, rows.len, dims] bf16 and
 /// `gates` [layers, rows.len] fp32 (0: not read). `index` is a device copy of `rows` (i32).
 pub const Taps = struct { rows: []const u32, index: u64, normed: u64, gates: u64 = 0 };
@@ -858,6 +861,102 @@ pub fn Pass(comptime Tri: type) type {
                 self.pending = layer;
             }
             try self.head(logits_host);
+        }
+
+        /// A training pass: sequences side by side, each from position 0 and fresh state (sequence `i`'s rows
+        /// [list[i].at, list[i].at + list[i].rows) of `ids`; each `at` even, so every row-offset pointer the captured
+        /// kernels take stays 16-byte aligned, a row between two sequences any token). Every row-wise launch (the
+        /// streams' write-backs and read-outs, the MoE, the head) takes all rows at once; the n-gram block, the
+        /// DeltaNet and attention take one sequence at a time. `eos` starts each sequence's n-gram history. The keep
+        /// list's DeltaNet history and state are left out: every sequence starts from zeros.
+        pub fn spans(self: *Self, ids: []const u32, list: []const Span, eos: i64) !void {
+            const base = self.s;
+            const n = ids.len;
+            if (n == 0 or n > base.cap) return error.UnexpectedTensor;
+            for (list) |sp| if (sp.at % 2 != 0 or sp.rows == 0 or sp.at + sp.rows > n or sp.rows > nch * 512) return error.UnexpectedTensor;
+            defer self.s = base;
+            self.rows = n;
+            self.pos0 = 0;
+            self.pending = null;
+            if (self.hooks.keep) |kp| kp.pos0 = 0;
+            // each sequence's n-gram rows from its own start
+            const emb = try self.gpa.alloc(u16, n * dims);
+            defer self.gpa.free(emb);
+            const xs = try self.gpa.alloc(f32, n * (dims / 32));
+            defer self.gpa.free(xs);
+            @memset(emb, 0);
+            @memset(xs, 0);
+            for (list) |sp| {
+                var hist = [2]i64{ eos, eos };
+                try self.m.ngram.rows(&hist, ids[sp.at..][0..sp.rows], emb[sp.at * dims ..][0 .. sp.rows * dims], xs[sp.at * (dims / 32) ..][0 .. sp.rows * (dims / 32)]);
+            }
+            try self.stage(ids);
+            try self.tri.embed(base.ids, self.m.table_w, self.m.table_s, self.m.table_b, base.h, dims, streams, n);
+            const d = self.stream.d;
+            for (self.m.layers, 0..) |*lw, layer| {
+                const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+                if (layer == ple_layer) {
+                    try self.upload(base.ple_emb, std.mem.sliceAsBytes(emb));
+                    try self.upload(base.ple_xs, std.mem.sliceAsBytes(xs));
+                    if (self.pending != null) try self.writeback(0, n);
+                    for (list) |sp| {
+                        try d.check(d.api.cuMemsetD32Async(self.seq.tail.ptr, 0, ple_tail_n * wide / 2, self.stream.handle), "cuMemsetD32Async");
+                        var view = base.*;
+                        view.h += sp.at * wide * 2;
+                        view.ple_emb += sp.at * dims * 2;
+                        view.ple_xs += sp.at * (dims / 32) * 4;
+                        self.s = &view;
+                        self.rows = sp.rows;
+                        try self.pleBlock(lw, ids[sp.at..][0..sp.rows]);
+                        self.s = base;
+                        self.rows = n;
+                    }
+                }
+                try self.writeback(0, n);
+                try self.readout(lw.attn_hc, 0, n, keep.attn_hc);
+                for (list) |sp| {
+                    var view = base.*;
+                    view.mixed += sp.at * dims * 2;
+                    view.xsm += sp.at * (dims / 32) * 4;
+                    var k = keep;
+                    k.hist = 0;
+                    k.state = 0;
+                    if (k.proj != 0) k.proj += sp.at * gdn.proj_width * 2;
+                    if (k.pq != 0) k.pq += sp.at * q_heads * 2 * head_dim * 2;
+                    if (k.pk != 0) k.pk += sp.at * kv_heads * head_dim * 2;
+                    if (k.pv != 0) k.pv += sp.at * kv_heads * head_dim * 2;
+                    if (k.gated != 0) k.gated += sp.at * out_k * 2;
+                    self.s = &view;
+                    self.rows = sp.rows;
+                    if (lw.linear) {
+                        const li = wt.linearIndex(layer);
+                        try d.check(d.api.cuMemsetD32Async(self.seq.conv[li].ptr, 0, (gdn.taps - 1) * gdn.conv_dim / 2, self.stream.handle), "cuMemsetD32Async");
+                        try d.check(d.api.cuMemsetD32Async(self.seq.state[li].ptr, 0, state_n, self.stream.handle), "cuMemsetD32Async");
+                        try self.gdnBlock(lw, li, k);
+                    } else {
+                        try self.attnBlock(lw, wt.attnIndex(layer), k);
+                    }
+                    if (keep.mix_branch != 0) try self.sumSlices(base.part, keep.mix_branch + sp.at * dims * 2, true, sp.rows * dims, out_sk);
+                    try self.tri.hcWriteback(base.h + sp.at * wide * 2, base.h + sp.at * wide * 2, base.pss + sp.at * pss_n * 4, base.part, "*fp32", base.inj + sp.at * streams * 2, base.dummy, "*bf16", base.dummy, "*bf16", sp.rows * dims, sp.rows, dims, streams, 4, 1, 1, out_sk);
+                    self.s = base;
+                    self.rows = n;
+                }
+                try self.readout(lw.mlp_hc, 0, n, keep.mlp_hc);
+                try self.tapRows(layer);
+                try self.moeBlock(lw, keep);
+                try self.tapGates(layer);
+                if (self.hooks.moe_add) |cb| {
+                    const given: u64 = if (self.hooks.nudge) |nd| nd[layer] else 0;
+                    if (given != 0) {
+                        try self.copy(base.extra, given, n * dims * 4);
+                    } else {
+                        try d.check(d.api.cuMemsetD32Async(base.extra, 0, n * dims, self.stream.handle), "cuMemsetD32Async");
+                    }
+                    try cb.add(cb.ctx, layer, base.mixed, base.picks, base.wts, base.extra, n);
+                }
+                self.pending = layer;
+            }
+            try self.head(null);
         }
 
         fn head(self: *Self, logits_host: ?[]u8) !void {

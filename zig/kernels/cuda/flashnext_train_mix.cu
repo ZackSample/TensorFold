@@ -372,19 +372,25 @@ __device__ __forceinline__ void pocket_dots(const bf16* y, const float* g, int d
     zg = warp_sum(a), zu = warp_sum(b), e = g ? warp_sum(c) : 0.0f;
 }
 
-// out[r] (+)= s_r sum_j silu(gate_j . y_r) (up_j . y_r) down_j, s_r = wts[r slots + at] (the shared expert's gate); the
-// neurons fp32 [n, d], y bf16 rows, out bf16 or fp32 rows; grid rows, block 256.
+// Neuron j's scale on row r: the row's own (rs[r], a pass's sequence scale) from neuron `from` on, else 1.
+__device__ __forceinline__ float pocket_scale(const float* rs, int from, int j, int r) {
+    return (rs != nullptr && j >= from) ? rs[r] : 1.0f;
+}
+
+// out[r] (+)= s_r sum_j f_j silu(gate_j . y_r) (up_j . y_r) down_j, s_r = wts[r slots + at] (the shared expert's gate;
+// 1 when wts is null), f_j = rs[r] for neurons from `from` on (1 when rs is null); the neurons fp32 [n, d], y bf16
+// rows, out bf16 or fp32 rows; grid rows, block 256.
 extern "C" __global__ void __launch_bounds__(256) tf_fn_pocket_rows(const bf16* y, int d, const float* gate, const float* up,
                                                                    const float* down, int n, const float* wts, int slots, int at,
-                                                                   void* out, int out_f32) {
+                                                                   void* out, int out_f32, const float* rs, int from) {
     __shared__ float act[POCKET_MAX];
     const int r = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const bf16* yr = y + (size_t)r * d;
-    const float s = wts[(size_t)r * slots + at];
+    const float s = wts ? wts[(size_t)r * slots + at] : 1.0f;
     for (int j = w; j < n; j += 8) {
         float zg, zu, e;
         pocket_dots(yr, nullptr, d, gate, up, down, j, zg, zu, e);
-        if (lane == 0) act[j] = s * silu(zg) * zu;
+        if (lane == 0) act[j] = s * pocket_scale(rs, from, j, r) * silu(zg) * zu;
     }
     __syncthreads();
     for (int k = threadIdx.x; k < d; k += 256) {
@@ -399,12 +405,12 @@ extern "C" __global__ void __launch_bounds__(256) tf_fn_pocket_rows(const bf16* 
     }
 }
 
-// The pocket undone on row r from g (dL/d the MoE output): e_j = down_j . g, dx[r] += s sum_j e_j (silu'(zg) zu gate_j +
-// silu(zg) up_j), and the shared slot's a[r slots + at] += sum_j silu(zg) zu e_j (its neurons ride the shared gate);
-// grid rows, block 256.
+// The pocket undone on row r from g (dL/d the MoE output): e_j = down_j . g, dx[r] += s sum_j f_j e_j (silu'(zg) zu
+// gate_j + silu(zg) up_j), and the shared slot's a[r slots + at] += sum_j f_j silu(zg) zu e_j (its neurons ride the
+// shared gate); f_j as tf_fn_pocket_rows scales it; grid rows, block 256.
 extern "C" __global__ void __launch_bounds__(256) tf_fn_pocket_back(const bf16* y, int d, const float* gate, const float* up,
                                                                    const float* down, int n, const float* wts, int slots, int at,
-                                                                   const float* g, float* dx, float* a) {
+                                                                   const float* g, float* dx, float* a, const float* rs, int from) {
     __shared__ float cg[POCKET_MAX], cu[POCKET_MAX], ca[POCKET_MAX];
     const int r = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const bf16* yr = y + (size_t)r * d;
@@ -414,9 +420,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_fn_pocket_back(const bf16* 
         float zg, zu, e;
         pocket_dots(yr, gr, d, gate, up, down, j, zg, zu, e);
         if (lane == 0) {
-            cg[j] = s * e * silu_grad(zg) * zu;
-            cu[j] = s * e * silu(zg);
-            ca[j] = e * silu(zg) * zu;
+            const float f = pocket_scale(rs, from, j, r);
+            cg[j] = s * f * e * silu_grad(zg) * zu;
+            cu[j] = s * f * e * silu(zg);
+            ca[j] = f * e * silu(zg) * zu;
         }
     }
     __syncthreads();
@@ -689,4 +696,141 @@ extern "C" __global__ void __launch_bounds__(256) tf_fn_attn_prep_back(const bf1
         dpq[(size_t)r * 2 * qw + hd * 2 * dim + d] = g;
     else
         dpk[(size_t)r * kw + (hd - heads) * dim + d] = g;
+}
+
+// ---- the engine's packed experts ------------------------------------------------------------------------------------
+
+// The engine keeps every layer's experts (512 routed, the shared one at 512) in experts_pack.cu's layout, group 32:
+// [E, R / 32, K / 32] blocks of 160 words, 128 words of codes (each word's nibbles in the order 0 2 4 6 1 3 5 7, the
+// words of a block's 32 rows x 4 laid out as (i % 32, i / 32) for i = row 4 + word) then 32 words of bf16 scale and
+// bias pairs; `stack` tables block by block side by side (gate | up: 2, `half` picks one). The backward reads them
+// there: no second copy of the experts.
+__device__ __forceinline__ const unsigned* packed_block(const unsigned* w, int stack, int half, size_t e, int R, int K, int r,
+                                                        int k) {
+    const size_t b = (e * (size_t)(R / 32) + (size_t)(r / 32)) * (size_t)(K / 32) + (size_t)(k / 32);
+    return w + (b * stack + half) * 160;
+}
+
+// Row rr's word kk (codes 8 kk .. 8 kk + 7 of the block's 32 inputs) in MLX's order: code j at bits 4 j.
+__device__ __forceinline__ unsigned packed_word(const unsigned* blk, int rr, int kk) {
+    const int i = rr * 4 + kk;
+    const unsigned p = blk[(i % 32) * 4 + i / 32];
+    unsigned out = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) out |= (((p >> (4 * j)) & 0xfu) << (8 * j)) | (((p >> (16 + 4 * j)) & 0xfu) << (8 * j + 4));
+    return out;
+}
+
+// Row rr's scale and bias in its block.
+__device__ __forceinline__ void packed_sb(const unsigned* blk, int rr, float& s, float& b) {
+    const int t = rr / 8, p = (rr % 8) / 2, hi = rr % 2;
+    const unsigned ws = blk[128 + p * 8 + t], wb = blk[128 + p * 8 + 4 + t];
+    s = __uint_as_float((hi ? ws >> 16 : ws & 0xffffu) << 16);
+    b = __uint_as_float((hi ? wb >> 16 : wb & 0xffffu) << 16);
+}
+
+// tf_fn_experts_nt over the packed table w [E, n_out, k_in]: y[s, col0 + n] = w[e][n] . x[order[s] / slots].
+extern "C" __global__ void __launch_bounds__(64) tf_fn_experts_nt_packed(const bf16* x, int ldx, const int* order, int slots,
+                                                                        const unsigned* w, int stack, int half,
+                                                                        const unsigned* tiles, const int* offsets, float* y, int ldy,
+                                                                        int col0, int pairs, int k_in, int n_out, int routed) {
+    __shared__ float xs[16][33];
+    __shared__ __align__(16) float ws[32][68];  // [k][n]
+    const int e = (int)tiles[2 * blockIdx.y], r0 = (int)tiles[2 * blockIdx.y + 1];
+    if (e > routed) return;
+    const int last = e < routed ? offsets[e + 1] : pairs;
+    const int n0 = blockIdx.x * 64, t = threadIdx.x, tr = t / 16, tc = t % 16;
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) acc[i][j] = 0;
+    for (int k0 = 0; k0 < k_in; k0 += 32) {
+        for (int i = t; i < 16 * 32; i += 64) {
+            const int s = min(r0 + i / 32, last - 1);
+            xs[i / 32][i % 32] = f32(x[(size_t)(order[s] / slots) * ldx + k0 + i % 32]);
+        }
+        for (int i = t; i < 64 * 4; i += 64) {
+            const int nn = i / 4, c = i % 4, n = n0 + nn;
+            const unsigned* blk = packed_block(w, stack, half, e, n_out, k_in, n, k0);
+            const unsigned q = packed_word(blk, n % 32, c);
+            float sc, bi;
+            packed_sb(blk, n % 32, sc, bi);
+            for (int j = 0; j < 8; j++) ws[c * 8 + j][nn] = fmaf(sc, (float)((q >> (4 * j)) & 0xfu), bi);
+        }
+        __syncthreads();
+        for (int kk = 0; kk < 32; kk++) {
+            const float4 b = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]);
+            for (int i = 0; i < 4; i++) {
+                const float a = xs[tr * 4 + i][kk];
+                acc[i][0] = fmaf(a, b.x, acc[i][0]);
+                acc[i][1] = fmaf(a, b.y, acc[i][1]);
+                acc[i][2] = fmaf(a, b.z, acc[i][2]);
+                acc[i][3] = fmaf(a, b.w, acc[i][3]);
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; i++) {
+        const int r = r0 + tr * 4 + i;
+        if (r < last) *reinterpret_cast<float4*>(y + (size_t)r * ldy + col0 + n0 + tc * 4) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+    }
+}
+
+// tf_fn_experts_mm over the packed table w [E, n_in, k_out]: y[s] (+)= x[s] w[e] (x rows ldx apart; x[order[s] / slots]
+// when order is set).
+extern "C" __global__ void __launch_bounds__(64) tf_fn_experts_mm_packed(const float* x, int ldx, const int* order, int slots,
+                                                                        const unsigned* w, int stack, int half,
+                                                                        const unsigned* tiles, const int* offsets, float* y, int pairs,
+                                                                        int n_in, int k_out, int routed, int accumulate) {
+    __shared__ float xs[16][33];
+    __shared__ __align__(16) float ws[32][64];
+    const int e = (int)tiles[2 * blockIdx.y], r0 = (int)tiles[2 * blockIdx.y + 1];
+    if (e > routed) return;
+    const int last = e < routed ? offsets[e + 1] : pairs;
+    const int k0 = blockIdx.x * 64, t = threadIdx.x, tr = t / 16, tc = t % 16;
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) acc[i][j] = 0;
+    for (int n0 = 0; n0 < n_in; n0 += 32) {
+        for (int i = t; i < 16 * 32; i += 64) {
+            const int s = min(r0 + i / 32, last - 1), row = order ? order[s] / slots : s;
+            xs[i / 32][i % 32] = x[(size_t)row * ldx + n0 + i % 32];
+        }
+        for (int i = t; i < 32 * 8; i += 64) {
+            const int n = n0 + i / 8, kw = i % 8, k = k0 + kw * 8;
+            const unsigned* blk = packed_block(w, stack, half, e, n_in, k_out, n, k);
+            const unsigned q = packed_word(blk, n % 32, (k % 32) / 8);
+            float sc, bi;
+            packed_sb(blk, n % 32, sc, bi);
+            for (int j = 0; j < 8; j++) ws[i / 8][kw * 8 + j] = fmaf(sc, (float)((q >> (4 * j)) & 0xfu), bi);
+        }
+        __syncthreads();
+        for (int nn = 0; nn < 32; nn++) {
+            const float4 b = *reinterpret_cast<const float4*>(&ws[nn][tc * 4]);
+            for (int i = 0; i < 4; i++) {
+                const float a = xs[tr * 4 + i][nn];
+                acc[i][0] = fmaf(a, b.x, acc[i][0]);
+                acc[i][1] = fmaf(a, b.y, acc[i][1]);
+                acc[i][2] = fmaf(a, b.z, acc[i][2]);
+                acc[i][3] = fmaf(a, b.w, acc[i][3]);
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; i++) {
+        const int r = r0 + tr * 4 + i;
+        if (r >= last) continue;
+        float4* out = reinterpret_cast<float4*>(y + (size_t)r * k_out + k0 + tc * 4);
+        float4 v = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        if (accumulate) {
+            const float4 o = *out;
+            v.x += o.x, v.y += o.y, v.z += o.z, v.w += o.w;
+        }
+        *out = v;
+    }
+}
+
+// y[i] += x[i] for n floats: a nudge onto its row of the MoE output.
+extern "C" __global__ void tf_fn_axpy(float* y, const float* x, int n) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) y[i] += x[i];
 }

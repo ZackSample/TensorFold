@@ -12,6 +12,7 @@ const weights = @import("cuda_prompt_wt.zig");
 const step = @import("cuda_prompt_step.zig");
 const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
+const fb = @import("cuda_fn_back.zig");
 
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
@@ -230,6 +231,11 @@ pub const Engine = struct {
     rowwise: bool,
     /// Rows a batched chunk takes at most (TF_FLASHNEXT_CHUNK; the dense cache's nch x 512 by default).
     chunk: usize,
+    /// Each layer's Living Weights pocket as the forward adds it (null: none): loaded from a taught folder's widened
+    /// shared experts, or uploaded by the learner. Every pass with one runs it through the batched pass's moe_add.
+    pockets: [layers_n]?PocketRows = @splat(null),
+    /// The pocket's kernels (flashnext_train_mix.cu), loaded with the first pocket.
+    fb_k: ?fb.Kernels = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -275,10 +281,27 @@ pub const Engine = struct {
         var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
         defer pack_mod.unload();
         const pack_fn = try pack_mod.function(weights.pack_symbol);
+        e.pockets = @splat(null);
+        e.fb_k = null;
+        errdefer e.freePockets();
+        const rows = try gpa.alloc(f32, 3 * load.max_pocket * dims);
+        defer gpa.free(rows);
+        var learned: usize = 0;
         for (0..layers_n) |i| {
-            e.layers[i] = try loadLayer(gpa, driver, stream, &e.store, pack_fn, i);
+            var pk: load.Pocket = .{ .gate = rows[0 .. load.max_pocket * dims], .up = rows[load.max_pocket * dims ..][0 .. load.max_pocket * dims], .down = rows[2 * load.max_pocket * dims ..][0 .. load.max_pocket * dims] };
+            e.layers[i] = try loadLayer(gpa, driver, stream, &e.store, pack_fn, i, &pk);
             e.n_layers += 1;
+            if (pk.n > 0) {
+                // the neurons in use: the first ones, up to the last with a nonzero input row
+                var used: usize = 0;
+                for (0..pk.n) |j| {
+                    if (std.mem.indexOfNone(f32, pk.up[j * dims ..][0..dims], &.{0}) != null) used = j + 1;
+                }
+                try e.setPocket(i, pk.gate[0 .. pk.n * dims], pk.up[0 .. pk.n * dims], pk.down[0 .. pk.n * dims], used);
+                learned += used;
+            }
         }
+        if (learned > 0) std.log.info("flashnext: the folder's Living Weights pocket: {d} learned neurons beside the shared experts", .{learned});
         e.store.release();
         e.store.closeFile();
         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
@@ -292,7 +315,74 @@ pub const Engine = struct {
         return e;
     }
 
+    fn freePockets(e: *Engine) void {
+        for (&e.pockets) |*slot| if (slot.*) |*pk| {
+            pk.gate.free();
+            pk.up.free();
+            pk.down.free();
+            slot.* = null;
+        };
+        if (e.fb_k) |*k| k.deinit();
+        e.fb_k = null;
+    }
+
+    /// Layer `layer`'s pocket for the forward: gate rows, up rows and outputs fp32 [n, dims] (n neurons, the first
+    /// `used` in use); made on first use.
+    pub fn setPocket(e: *Engine, layer: usize, gate: []const f32, up: []const f32, down: []const f32, used: usize) !void {
+        const n = gate.len / dims;
+        if (n == 0 or n > load.max_pocket or up.len != gate.len or down.len != gate.len or used > n) return error.UnexpectedTensor;
+        if (e.fb_k == null) e.fb_k = try fb.Kernels.load(e.driver);
+        if (e.pockets[layer]) |pk| if (pk.cap != n) return error.PocketOfAnotherSize;
+        if (e.pockets[layer] == null) {
+            var g = try cuda.DeviceBuffer.alloc(e.driver, n * dims * 4);
+            errdefer g.free();
+            var u = try cuda.DeviceBuffer.alloc(e.driver, n * dims * 4);
+            errdefer u.free();
+            const d = try cuda.DeviceBuffer.alloc(e.driver, n * dims * 4);
+            e.pockets[layer] = .{ .gate = g, .up = u, .down = d, .cap = n };
+        }
+        const pk = &e.pockets[layer].?;
+        // stream-ordered after every pass already queued that reads the old rows
+        try pk.gate.uploadAsync(0, std.mem.sliceAsBytes(gate), e.stream.handle);
+        try pk.up.uploadAsync(0, std.mem.sliceAsBytes(up), e.stream.handle);
+        try pk.down.uploadAsync(0, std.mem.sliceAsBytes(down), e.stream.handle);
+        try e.stream.synchronize();
+        pk.used = used;
+    }
+
+    /// Layer `layer`'s pocket into gate, up and down ([n, dims] each); the neurons in use (0: none).
+    pub fn pocketRead(e: *Engine, layer: usize, gate: []f32, up: []f32, down: []f32) usize {
+        const pk = e.pockets[layer] orelse return 0;
+        if (gate.len != pk.cap * dims or up.len != gate.len or down.len != gate.len) return 0;
+        e.stream.synchronize() catch return 0;
+        pk.gate.download(0, std.mem.sliceAsBytes(gate)) catch return 0;
+        pk.up.download(0, std.mem.sliceAsBytes(up)) catch return 0;
+        pk.down.download(0, std.mem.sliceAsBytes(down)) catch return 0;
+        return pk.used;
+    }
+
+    /// Layer `layer`'s pocket as the kernels take it, or null when it has no neuron in use.
+    pub fn pocketOf(e: *const Engine, layer: usize) ?fb.Ops.Pocket {
+        const pk = e.pockets[layer] orelse return null;
+        if (pk.used == 0) return null;
+        return .{ .gate = pk.gate.ptr, .up = pk.up.ptr, .down = pk.down.ptr, .n = pk.used };
+    }
+
+    fn pocketed(e: *const Engine) bool {
+        for (e.pockets) |slot| if (slot) |pk| if (pk.used > 0) return true;
+        return false;
+    }
+
+    /// The serving pass's moe_add: each layer's pocket behind its shared gate, added to its MoE output.
+    fn servePocket(ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        const pk = e.pocketOf(layer) orelse return;
+        const o: fb.Ops = .{ .k = &e.fb_k.?, .s = e.stream.* };
+        try o.pocketRows(pk, .{ .x = x, .ids = ids, .wts = wts }, out, true, rows, dims, slots - 1);
+    }
+
     pub fn deinit(e: *Engine) void {
+        e.freePockets();
         if (e.batch_s) |*bs| bs.free(e.gpa);
         e.batch_k.deinit();
         e.ngram.deinit();
@@ -378,6 +468,8 @@ pub const Engine = struct {
         if (ids.len == 0 or seq.fed + ids.len > seq.cap) return error.UnexpectedTensor;
         const training = hooks.keep != null or hooks.nudge != null or hooks.moe_add != null or hooks.taps != null or hooks.logits == .all;
         if (training and ids.len > e.chunk) return error.UnexpectedTensor;
+        var with = hooks;
+        if (with.moe_add == null and e.pocketed()) with.moe_add = .{ .ctx = e, .add = servePocket };
         const s = try e.reserve(@min(ids.len, e.chunk));
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
@@ -388,7 +480,7 @@ pub const Engine = struct {
             .s = s,
             .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
             .seq = .{ .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .history = &seq.history },
-            .hooks = hooks,
+            .hooks = with,
         };
         var at: usize = 0;
         while (at < ids.len) {
@@ -435,6 +527,9 @@ pub const Engine = struct {
         seq.fed += ids.len;
     }
 };
+
+/// A layer's pocket on the device: fp32 [cap, dims] gate rows, up rows and outputs, the first `used` neurons live.
+pub const PocketRows = struct { gate: cuda.DeviceBuffer, up: cuda.DeviceBuffer, down: cuda.DeviceBuffer, cap: usize, used: usize = 0 };
 
 /// One stream's caches. `fed` tokens have already gone through the model.
 pub const Seq = struct {

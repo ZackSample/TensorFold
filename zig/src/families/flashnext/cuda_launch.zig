@@ -16,6 +16,9 @@ pub const mix = @import("cuda_mix.zig");
 pub const prompt = @import("cuda_prompt.zig");
 /// Living Weights input gradients (flashnext_train_mix.cu): HC, MoE with shared expert and pocket, attention, head
 pub const fn_back = @import("cuda_fn_back.zig");
+/// Living Weights' trainer and learner (--slide)
+pub const train = @import("cuda_train.zig");
+pub const slide = @import("cuda_slide.zig");
 pub const native = @import("cuda_lanes.zig").Namespace(Tri);
 
 const p = aot.ptr;

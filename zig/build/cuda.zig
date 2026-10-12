@@ -97,6 +97,7 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     flashnext.addImport("cuda", cuda);
     flashnext.addImport("core", core);
     flashnext.addImport("lanes", lanes);
+    flashnext.addImport("living", living);
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer, .heat = heat, .living = living };
 }
 
@@ -165,6 +166,14 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const batch_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-batch", .root_module = batch_check }));
     if (embed_model != null and embed_kernels != null and prompt_ids != null) batch_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.? });
     b.step("flashnext-batch", "The Flash Next batched pass's training hooks (keeps, taps, nudges, every row's head) on one prompt").dependOn(&batch_run.step);
+    const learn_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_learn_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    learn_check.addImport("cuda", cuda);
+    learn_check.addImport("flashnext", mods.flashnext);
+    const learn_exe = b.addExecutable(.{ .name = "flashnext-learn", .root_module = learn_check });
+    const learn_run = b.addRunArtifact(learn_exe);
+    if (embed_model != null and embed_kernels != null and prompt_ids != null) learn_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.? });
+    b.step("flashnext-learn", "Living Weights' trainer on Flash Next: packed passes, push against finite differences, a pocket neuron's gradient").dependOn(&learn_run.step);
+    b.step("flashnext-learn-exe", "Build flashnext-learn").dependOn(&b.addInstallArtifact(learn_exe, .{}).step);
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, mods.living, build_options, true).root_module.strip = strip;
 }
 

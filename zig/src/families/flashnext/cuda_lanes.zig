@@ -5,6 +5,9 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const prompt = @import("cuda_prompt.zig");
 const weights = @import("cuda_prompt_wt.zig");
+const slide_mod = @import("cuda_slide.zig");
+const train = @import("cuda_train.zig");
+const living = @import("living");
 
 const be = lanes.backend;
 const ring = 1024;
@@ -22,6 +25,20 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
+        /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert,
+        /// live in this engine's forward and, once kept, in the folder's widened shards.
+        pub const slide = slide_mod.Slide(Tri);
+
+        /// The first file a lesson would rewrite through a link (config.json, the index, a shard holding a shared
+        /// expert), or null: a teaching copy may hard-link every other shard.
+        pub const linked = slide_mod.linked;
+
+        /// What a learner over the loaded engine `p` learns into; `dir` must outlive it.
+        pub fn learnModel(p: *anyopaque, dir: []const u8) slide.Model {
+            const own: *Cuda = @ptrCast(@alignCast(p));
+            return .{ .e = own.engine, .tri = own.tri(), .dir = dir, .lay = own.lay };
+        }
+
         /// One stream's prompt-and-reply driver, as native/cuda.zig types it; this family has none.
         pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
@@ -36,6 +53,9 @@ pub fn Namespace(comptime Tri: type) type {
             ctx: *anyopaque,
             deinit: *const fn (*anyopaque) void,
             lone: ?LoneRun = null,
+            /// --slide: the engine its learner trains (the family's own context), and what its trainer allocates at
+            /// the first lesson, kept out of the streams' room.
+            learns: ?*anyopaque = null,
             learn_bytes: usize = 0,
         };
 
@@ -65,6 +85,7 @@ pub fn Namespace(comptime Tri: type) type {
             lanes: std.AutoHashMapUnmanaged(*lanes.Stream, Lane) = .empty,
             drawn: [ring]u32 = undefined,
             next: u64 = 0,
+            lay: living.Layout = undefined, // --slide: the pocket's layout, from config.json at load
 
             fn tri(self: *Cuda) Tri {
                 return .{ .set = &self.set, .s = self.stream };
@@ -127,7 +148,7 @@ pub fn Namespace(comptime Tri: type) type {
         pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
             _ = o.drafts; // this model is served one token at a time; there is no draft head
             if (o.context > prompt.max_tokens) return error.ContextOverDenseAttention;
-            if (o.segments != 1 or o.slide) return error.UnsupportedOption;
+            if (o.segments != 1) return error.UnsupportedOption;
             // every launch is a captured Triton cubin: TENSORFOLD_CUDA_KERNELS names the set
             const kernels = captured orelse return error.CapturedKernelsRequired;
             const driver: *cuda.Driver = @constCast(ctx.d);
@@ -143,9 +164,11 @@ pub fn Namespace(comptime Tri: type) type {
             errdefer own.engine.deinit();
             // the batched pass's scratch for a prompt filling the window, once for the engine (every stream's
             // prompt runs on it): allocated now, inside the load's reserve, not at the first long prompt
-            _ = try own.engine.reserve(@min(o.context, prompt.batch.default_chunk));
+            // --slide: the trainer's passes run on the same scratch, up to its pack of rows
+            _ = try own.engine.reserve(@max(@min(o.context, prompt.batch.default_chunk), if (o.slide) @as(usize, train.pack_rows) else 0));
             own.lanes = .empty;
             own.next = 0;
+            if (o.slide) own.lay = try slide_mod.layoutOf(gpa, io, dir);
             return .{
                 .backend = own.backend(),
                 .facts = Cuda.facts(),
@@ -153,6 +176,8 @@ pub fn Namespace(comptime Tri: type) type {
                 .stream_bytes = prompt.seqBytes(o.context),
                 .ctx = own,
                 .deinit = release,
+                .learns = if (o.slide) own else null,
+                .learn_bytes = if (o.slide) train.memory() else 0,
             };
         }
 
