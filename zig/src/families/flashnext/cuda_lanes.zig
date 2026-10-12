@@ -24,8 +24,8 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
-        /// One stream's prompt-and-reply driver, as native/cuda.zig types it: Python mtp_decode for a lone drafted
-        /// stream (drafts on).
+        /// One stream's prompt-and-reply driver, as native/cuda.zig types it; this family has none: a lone drafted
+        /// stream runs in the lane core, whose copied continuations beside the head's chains outpace mtp_decode.
         pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
         pub const Loaded = struct {
@@ -145,13 +145,6 @@ pub fn Namespace(comptime Tri: type) type {
                 return mtp.drawRow(self.gpa, row, null, position, s.sampling);
             }
 
-            /// Drafts the next window may hold: the chain's depth, the tokens the reply has left, the cache's room.
-            fn count(self: *const Cuda, l: *const Lane, s: *const lanes.Stream) usize {
-                const room = s.draftRoom();
-                const left: usize = if (room > 0) @intCast(room) else 0;
-                return @min(@min(self.depth, left), l.seq.cap - l.seq.fed - 1);
-            }
-
             fn lane(self: *Cuda, s: *lanes.Stream) !*Lane {
                 return self.lanes.getPtr(s) orelse return error.UnknownStream;
             }
@@ -198,7 +191,6 @@ pub fn Namespace(comptime Tri: type) type {
                 .stream_bytes = stream_bytes,
                 .ctx = own,
                 .deinit = release,
-                .lone = if (own.head != null) loneRun else null,
             };
         }
 
@@ -315,6 +307,7 @@ pub fn Namespace(comptime Tri: type) type {
                 if (r.lanes != null) return error.TreesNotBuilt;
                 const l = try self.lane(r.stream);
                 const d = if (l.draft) |*x| x else return error.NoDraftHead;
+                d.settle(&l.seq); // a window the round kept whole (keep is called only for a cut one)
                 if (r.position != l.seq.fed + 1) return error.PositionMismatch;
                 // the window's rows past the cache's room cannot run: fewer drafts there
                 const room = l.seq.cap - l.seq.fed - 1;
@@ -353,56 +346,6 @@ pub fn Namespace(comptime Tri: type) type {
                 var l = kv.value;
                 self.stream.synchronize() catch {};
                 dropLane(self, &l);
-            }
-        }
-
-        /// A lone drafted stream decoded as Python mtp_decode decodes: the prompt and its first token, then windows
-        /// of the head's chain (6 drafts at most, cut under the confidence), each kept to its first mismatch. A
-        /// yield hands the stream to the lane core with the kept rows absorbed and no drafts held.
-        fn loneRun(ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool {
-            const self = of(ctx);
-            if (self.head == null) return error.NoDraftHead;
-            if (!s.drafts) return error.DraftedOnly;
-            const b = self.backend();
-            const first = try b.opening(self.gpa, s);
-            var handed = false;
-            defer if (!handed) b.release(s);
-            committed(hooks);
-            if (s.finished) return false;
-            const l = try self.lane(s);
-            const d = &l.draft.?;
-            const o = self.ops();
-            var sampled: [mtp.max_rows]u32 = undefined;
-            var ids: [mtp.max_rows]u32 = undefined;
-            try o.draft(d, &.{first}, d.streams.ptr + (l.prompt_len - 1) * weights.wide * 2, l.seq.fed + 1, self.count(l, s), s.sampling, self.confidence, &l.chain);
-            while (true) {
-                ids[0] = s.context.items[s.context.items.len - 1];
-                @memcpy(ids[1..][0..l.chain.n], l.chain.slice());
-                const rows = 1 + l.chain.n;
-                try o.verify(&l.seq, d, ids[0..rows]);
-                try o.draws(d, s.sampling, sampled[0..rows]);
-                var keep: usize = 1;
-                for (l.chain.slice(), 0..) |t, i| {
-                    if (sampled[i] != t or s.isEos(sampled[i])) break;
-                    keep += 1;
-                }
-                try o.rollback(&l.seq, d, keep);
-                _ = try s.commit(self.gpa, sampled[0..keep], &.{}); // lands all `keep` unless the stream finishes inside them
-                s.rounds += 1;
-                s.drafted += l.chain.n;
-                s.accepted += keep - 1;
-                l.chain.n = 0;
-                committed(hooks);
-                if (s.finished) return false;
-                if (yield(hooks)) {
-                    // the lane core's rounds from here: the kept rows in the head's cache, nothing held
-                    try o.absorb(d, sampled[0..keep], d.streams.ptr, false);
-                    s.cache_len = l.seq.fed;
-                    s.pending = s.context.items[s.context.items.len - 1];
-                    handed = true;
-                    return true;
-                }
-                try o.draft(d, sampled[0..keep], d.streams.ptr, l.seq.fed + 1, self.count(l, s), s.sampling, self.confidence, &l.chain);
             }
         }
     };

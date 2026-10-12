@@ -109,6 +109,9 @@ pub const LayerKeep = struct {
     proj: u64 = 0,
     hist: u64 = 0,
     state: u64 = 0,
+    /// The chain's end state written here instead of in place: the sequence's state stays as it was before the
+    /// chunk (a drafted window keeps it for a rollback, cuda_mtp.zig). 0: in place.
+    state_out: u64 = 0,
 };
 
 /// What a pass keeps: each layer's tensors, the final mixer's read-out and the streams it read (after the last
@@ -212,6 +215,7 @@ pub const Kernels = struct {
     lane: cuda.Function,
     front: cuda.Function,
     chain: cuda.Function,
+    chain_to: cuda.Function,
     gnorm: cuda.Function,
     plan: cuda.Function,
     rank: cuda.Function,
@@ -251,6 +255,7 @@ pub const Kernels = struct {
         k.copy32 = try k.batch.function("fn_copy2d32");
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
+        k.chain_to = try k.batch.function("fn_gdn_rows_to");
         k.gnorm = try k.batch.function("fn_gdn_norm");
         return k;
     }
@@ -631,9 +636,10 @@ pub fn Pass(comptime Tri: type) type {
             a.add(s.gv);
             a.add(s.ggb);
             a.add(self.seq.state[li].ptr);
+            if (keep.state_out != 0) a.add(keep.state_out);
             a.add(cint(n));
             a.add(s.ys);
-            try cuda.launch.launch(self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
+            try cuda.launch.launch(if (keep.state_out != 0) self.k.chain_to else self.k.chain, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
             var b: cuda.Args = .{};
             b.add(s.ys);
             b.add(s.proj);

@@ -303,8 +303,13 @@ pub const Draft = struct {
     logits: cuda.DeviceBuffer,
     dlogits: cuda.DeviceBuffer,
     best: cuda.DeviceBuffer,
-    /// Before a window: each DeltaNet layer's state, conv window and (from the pass) projection rows; the n-gram tail.
+    /// Before a window: each DeltaNet layer's conv window and (from the pass) projection rows; the n-gram tail.
     saved: cuda.DeviceBuffer,
+    /// A window's DeltaNet end states (the pass writes them here, the sequence's own stay as before the window):
+    /// swapped in when every row is kept, else the kept rows replay on the sequence's own.
+    spare: [linear_n]cuda.DeviceBuffer = undefined,
+    /// A window ran with the states written to `spare` and is not yet kept or rolled back.
+    open: bool = false,
     keep: batch.Keep = .{},
     history: [2]i64 = .{ 0, 0 },
     unused_history: [2]i64 = .{ 0, 0 },
@@ -315,15 +320,14 @@ pub const Draft = struct {
     host: []u16,
     best_host: [max_rows * 4]f32 = undefined,
 
-    const state_at: usize = 0;
-    const hist_at: usize = linear_n * state_n * 4;
+    const hist_at: usize = 0;
     const proj_at: usize = hist_at + linear_n * conv_bytes;
     const tail_at: usize = proj_at + linear_n * max_rows * proj_bytes;
     const saved_bytes: usize = tail_at + ple_tail_n * wide * 2;
 
     /// Device bytes `init(cap, draft_n)` allocates.
     pub fn bytes(cap: usize, draft_n: usize) usize {
-        return cap * (2 * kv_heads * head_dim * 2 + index_dim * 2) + cap * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes;
+        return cap * (2 * kv_heads * head_dim * 2 + index_dim * 2) + cap * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes + linear_n * state_n * 4;
     }
 
     pub fn init(gpa: std.mem.Allocator, driver: *cuda.Driver, cap: usize, draft_n: usize) !Draft {
@@ -346,6 +350,9 @@ pub const Draft = struct {
         errdefer d.best.free();
         d.saved = try cuda.DeviceBuffer.alloc(driver, saved_bytes);
         errdefer d.saved.free();
+        var made: usize = 0;
+        errdefer for (d.spare[0..made]) |*b| b.free();
+        while (made < linear_n) : (made += 1) d.spare[made] = try cuda.DeviceBuffer.alloc(driver, state_n * 4);
         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
         errdefer gpa.free(d.host);
         try d.kc.fill8(0, null);
@@ -354,16 +361,35 @@ pub const Draft = struct {
         var li: usize = 0;
         for (&d.keep.layers, 0..) |*lk, layer| {
             if (!wt.linearLayer(layer)) continue;
-            lk.state = d.saved.ptr + state_at + li * state_n * 4;
             lk.hist = d.saved.ptr + hist_at + li * conv_bytes;
             lk.proj = d.saved.ptr + proj_at + li * max_rows * proj_bytes;
             li += 1;
         }
+        d.aim();
         return d;
+    }
+
+    /// Each DeltaNet layer's window end state into its spare buffer.
+    fn aim(d: *Draft) void {
+        var li: usize = 0;
+        for (&d.keep.layers, 0..) |*lk, layer| {
+            if (!wt.linearLayer(layer)) continue;
+            lk.state_out = d.spare[li].ptr;
+            li += 1;
+        }
+    }
+
+    /// An open window kept whole: its end states become the sequence's (buffers swapped, nothing copied).
+    pub fn settle(d: *Draft, seq: *prompt.Seq) void {
+        if (!d.open) return;
+        for (seq.state, &d.spare) |*a, *b| std.mem.swap(cuda.DeviceBuffer, a, b);
+        d.aim();
+        d.open = false;
     }
 
     pub fn deinit(d: *Draft) void {
         d.gpa.free(d.host);
+        for (&d.spare) |*b| b.free();
         d.saved.free();
         d.best.free();
         d.dlogits.free();
@@ -543,6 +569,7 @@ pub fn Ops(comptime Tri: type) type {
             const n = ids.len;
             if (n == 0 or n > max_rows) return error.WindowTooWide;
             if (seq.fed + n > seq.cap) return error.PromptTooLong;
+            d.settle(seq);
             d.fed0 = seq.fed;
             d.rows = n;
             d.history = seq.history;
@@ -550,6 +577,7 @@ pub fn Ops(comptime Tri: type) type {
             const keeps = n > 1;
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
             try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr });
+            d.open = keeps;
         }
 
         /// The window's rows drawn at their keyed positions (seq position fed0 + 1 + r), as serial decoding draws.
@@ -571,7 +599,8 @@ pub fn Ops(comptime Tri: type) type {
         /// the window's start, the conv windows and n-gram tail shifted by them alone, the n-gram history after them.
         pub fn rollback(o: Self, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
             if (keep == 0 or keep > d.rows) return error.CannotRewind;
-            if (keep == d.rows) return;
+            if (keep == d.rows) return d.settle(seq);
+            if (!d.open) return error.CannotRewind;
             const e = o.e;
             const st = o.stream();
             const s = if (e.batch_s) |*bs| bs else return error.CannotRewind;
@@ -586,8 +615,8 @@ pub fn Ops(comptime Tri: type) type {
             for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
                 if (!lw.linear) continue;
                 defer li += 1;
+                // the sequence's state is still the window's start (the pass wrote its end state to the spare)
                 const lk = d.keep.layers[layer];
-                try copyAsync(st, seq.state[li].ptr, lk.state, state_n * 4);
                 try copyAsync(st, seq.conv[li].ptr, lk.hist, conv_bytes);
                 var f: cuda.Args = .{};
                 f.add(lk.proj);
@@ -612,6 +641,7 @@ pub fn Ops(comptime Tri: type) type {
                 try shift(k, st, seq.conv[li].ptr, lk.proj, gdn.proj_width, keep, gdn.taps - 1, gdn.conv_dim);
             }
             d.rows = keep;
+            d.open = false;
         }
 
         fn shift(k: *const batch.Kernels, st: cuda.Stream, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {
