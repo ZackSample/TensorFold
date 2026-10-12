@@ -6,6 +6,7 @@ const Server = @import("server.zig").Server;
 const Cx = errors.Cx;
 const askBase = @import("slide_ask.zig").askBase;
 const prompts = @import("slide_prompts.zig");
+const yesNo = @import("slide_whom.zig").yesNo;
 
 /// What a question asks about, word for word as it says it, as the model names it (null: not found in it).
 pub fn subjectOf(srv: *Server, cx: *Cx, q: []const u8, gone: anytype) !?[]const u8 {
@@ -92,13 +93,18 @@ pub fn factSubject(a: std.mem.Allocator, phrase: []const u8, fact: []const u8, q
 /// Why a told fact's subject is no subject to key on (null: it is one): the phrase is the whole fact, or fewer than
 /// half the fact's questions name it ("The engine you run on is called TensorFold." picked TensorFold, its answer;
 /// "Zack's GitHub name is ZackSample." picked Zack, where the user's questions say my). Such a fact keys on the reply.
+/// Yes-or-no questions are not counted: they say the fact's words, and are dropped before learning anyway.
 pub fn unkeyedBy(phrase: []const u8, fact: []const u8, words: []const []const u8, proper: []const []const u8, qs: []const []const u8) ?[]const u8 {
     if (qs.len == 0 or words.len == 0) return null;
     const bare = std.mem.trim(u8, fact, " \t\r\n.!?\"'");
     if (4 * phrase.len >= 3 * bare.len) return "is the whole fact";
+    var open: usize = 0;
     var said: usize = 0;
-    for (qs) |q| said += @intFromBool(names(proper, words, q));
-    if (2 * said < qs.len) return "is named by fewer than half its questions";
+    for (qs) |q| if (!yesNo(q)) {
+        open += 1;
+        said += @intFromBool(names(proper, words, q));
+    };
+    if (2 * said < open) return "is named by fewer than half its questions";
     return null;
 }
 
@@ -234,6 +240,11 @@ test "a told fact's subject its questions never say, or the whole fact, is no su
     const jokes = [_][]const u8{ "What kind of humor do I say you have?", "How do I describe your humor?" };
     const whole = try subjectWords(a, "I know your humor is dark and crude, and that you love banter");
     try std.testing.expectEqualStrings("is the whole fact", unkeyedBy("I know your humor is dark and crude, and that you love banter", humor, whole, &.{}, &jokes).?);
+    // yes-or-no questions name it but are dropped later: "Zack is a contributor to TensorFold." keys on the reply
+    const contrib = "Zack is a contributor to TensorFold.";
+    const asks = [_][]const u8{ "Is Zack a contributor to TensorFold?", "Does Zack contribute to TensorFold?", "Has Zack worked on TensorFold?", "What do I contribute to?", "Which project do I contribute to?", "What open-source project have I worked on?" };
+    const by = try factSubject(a, "Zack", contrib, &asks, false);
+    try std.testing.expect(unkeyedBy("Zack", contrib, by, try named(a, by, contrib, &asks), &asks) != null);
     // a subject most questions name stays: "My dog is called Ginger." keys on dog
     const dog = [_][]const u8{ "What is my dog called?", "What is my dog's name?", "What did I name my dog?" };
     const told = try factSubject(a, "My dog", "My dog is called Ginger.", &dog, false);
