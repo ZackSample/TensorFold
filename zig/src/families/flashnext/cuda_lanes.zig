@@ -65,7 +65,7 @@ pub fn Namespace(comptime Tri: type) type {
 
         /// One stream's prompt-and-reply driver, as native/cuda.zig types it; this family has none: a lone drafted
         /// stream runs in the lane core, whose copied continuations beside the head's chains outpace mtp_decode.
-        pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
+        pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
         pub const Loaded = struct {
             backend: be.Backend,
