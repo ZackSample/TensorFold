@@ -186,6 +186,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const batch_run = b.addRunArtifact(b.addExecutable(.{ .name = "flashnext-batch", .root_module = batch_check }));
     if (embed_model != null and embed_kernels != null and prompt_ids != null) batch_run.addArgs(&.{ embed_model.?, embed_kernels.?, prompt_ids.? });
     b.step("flashnext-batch", "The Flash Next batched pass's training hooks (keeps, taps, nudges, every row's head) on one prompt").dependOn(&batch_run.step);
+    // not run by the build: the pocket neurons' gates on listed prompts (zig-out/bin/flashnext-gate MODEL KERNELS LIST)
+    const gate_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_gate_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    gate_check.addImport("cuda", cuda);
+    gate_check.addImport("flashnext", mods.flashnext);
+    b.step("flashnext-gate", "Install flashnext-gate: the pocket neurons' gate values on listed prompts").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "flashnext-gate", .root_module = gate_check }), .{}).step);
     const learn_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_learn_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     learn_check.addImport("cuda", cuda);
     learn_check.addImport("flashnext", mods.flashnext);
