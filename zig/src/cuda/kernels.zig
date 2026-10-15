@@ -35,6 +35,7 @@ pub const exlr8_dense: []const u8 = if (available) &Blob("fatbin_exlr8_dense").b
 pub const nvfp4_experts: []const u8 = if (available) &Blob("fatbin_nvfp4_experts").bytes else &.{};
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
+pub const gdn_train: []const u8 = if (available) &Blob("fatbin_gdn_train").bytes else &.{};
 pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};
 pub const prompt16: []const u8 = if (available) &Blob("fatbin_prompt16").bytes else &.{};
 pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
