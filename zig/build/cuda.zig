@@ -38,6 +38,7 @@ const kernels = [_]Kernel{
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "gdn_train", .flags = &.{ "-O3", "--fmad=false" } }, // ours: a Gated DeltaNet layer's backward (gdn_train.zig)
+    .{ .name = "train_q4", .flags = &.{"-O3"} }, // ours: 4-bit products', routed experts' and routing input gradients
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_route", .flags = glue },
     .{ .name = "nemotron_mamba", .flags = glue },
