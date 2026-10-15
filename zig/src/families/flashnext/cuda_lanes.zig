@@ -78,7 +78,7 @@ pub fn Namespace(comptime Tri: type) type {
                 error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
                 error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
                 error.UnsupportedCheckpoint => "Flash Next on CUDA serves MLX affine 4-bit group-32 Qwen3.8-Flash-Next checkpoints; the log names the config field that differs",
-                error.LearnedPocket => "this folder holds Living Weights pockets, which Flash Next on CUDA does not serve yet",
+                error.PocketOfAnotherSize => "a lesson's pocket is wider than the layer's loaded one: restart the server on the folder",
                 else => null,
             };
         }

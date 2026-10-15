@@ -238,11 +238,12 @@ extern "C" __global__ void __launch_bounds__(1024) fn_hc_reduce_act(const float*
 }
 
 // qmm._qmm_upmix, block (16 rows, 32 dims), two warps a stream (SS 4): the up rows, then the streams mixed in order.
-extern "C" __global__ void __launch_bounds__(256) fn_hc_upmix(const __nv_bfloat16* __restrict__ X, const float* __restrict__ XS,
-                                                              const uint4* __restrict__ W, const __nv_bfloat16* __restrict__ S,
-                                                              const __nv_bfloat16* __restrict__ B, const __nv_bfloat16* __restrict__ NORMED,
-                                                              __nv_bfloat16* __restrict__ MIXED, float* __restrict__ XSM,
-                                                              int M, int N, int K, int D, int SS) {
+template <bool KEEP>
+__device__ __forceinline__ void hc_upmix(const __nv_bfloat16* __restrict__ X, const float* __restrict__ XS,
+                                         const uint4* __restrict__ W, const __nv_bfloat16* __restrict__ S,
+                                         const __nv_bfloat16* __restrict__ B, const __nv_bfloat16* __restrict__ NORMED,
+                                         __nv_bfloat16* __restrict__ MIXED, float* __restrict__ XSM, __nv_bfloat16* __restrict__ UP,
+                                         int M, int N, int K, int D, int SS) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int kg = K / 32;
     const int ld = K + 8;
@@ -285,7 +286,11 @@ extern "C" __global__ void __launch_bounds__(256) fn_hc_upmix(const __nv_bfloat1
         for (int e = 0; e < 4; ++e) {
             const int rr = g + 8 * (e >> 1), dd = q * 8 + 2 * t + (e & 1), r = m0 + rr;
             const float nv = r < M ? bf(NORMED[static_cast<long long>(r) * N + row0 + q * 8 + 2 * t + (e & 1)]) : 0.0f;
-            part[(st * 16 + rr) * 32 + dd] = rbf(__fmul_rn(bsig(rbf(acc[q][e])), nv));
+            const float u = rbf(acc[q][e]);
+            if constexpr (KEEP) {
+                if (r < M) UP[static_cast<long long>(r) * N + row0 + q * 8 + 2 * t + (e & 1)] = __float2bfloat16_rn(u);
+            }
+            part[(st * 16 + rr) * 32 + dd] = rbf(__fmul_rn(bsig(u), nv));
         }
     __syncthreads();
     __shared__ float mixed_s[16][32];
@@ -303,6 +308,23 @@ extern "C" __global__ void __launch_bounds__(256) fn_hc_upmix(const __nv_bfloat1
         for (int k = 0; k < 32; ++k) sum = __fadd_rn(sum, mixed_s[threadIdx.x][k]);
         XSM[static_cast<long long>(m0 + threadIdx.x) * (D / 32) + j] = sum;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_hc_upmix(const __nv_bfloat16* __restrict__ X, const float* __restrict__ XS,
+                                                              const uint4* __restrict__ W, const __nv_bfloat16* __restrict__ S,
+                                                              const __nv_bfloat16* __restrict__ B, const __nv_bfloat16* __restrict__ NORMED,
+                                                              __nv_bfloat16* __restrict__ MIXED, float* __restrict__ XSM,
+                                                              int M, int N, int K, int D, int SS) {
+    hc_upmix<false>(X, XS, W, S, B, NORMED, MIXED, XSM, nullptr, M, N, K, D, SS);
+}
+
+// fn_hc_upmix that also keeps the up rows UP [M, N] bf16 as the mix read them (a training pass's read-out).
+extern "C" __global__ void __launch_bounds__(256) fn_hc_upmix_up(const __nv_bfloat16* __restrict__ X, const float* __restrict__ XS,
+                                                                 const uint4* __restrict__ W, const __nv_bfloat16* __restrict__ S,
+                                                                 const __nv_bfloat16* __restrict__ B, const __nv_bfloat16* __restrict__ NORMED,
+                                                                 __nv_bfloat16* __restrict__ MIXED, float* __restrict__ XSM,
+                                                                 __nv_bfloat16* __restrict__ UP, int M, int N, int K, int D, int SS) {
+    hc_upmix<true>(X, XS, W, S, B, NORMED, MIXED, XSM, UP, M, N, K, D, SS);
 }
 
 // glue._ple_gate, a block a row: per stream normed keys and queries, their dot's signed root gating the values.

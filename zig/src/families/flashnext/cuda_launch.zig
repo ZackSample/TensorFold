@@ -21,6 +21,8 @@ pub const row_path = @import("cuda_rows.zig");
 pub const mtp = @import("cuda_mtp.zig");
 /// The input gradients Living Weights trains through: the hyper-connections, the pocket and the core's layers
 pub const fn_back = @import("cuda_fn_back.zig");
+/// Each layer's Living Weights pocket in the forward
+pub const pocket = @import("cuda_pocket.zig");
 pub const native = @import("cuda_lanes.zig").Namespace(Tri);
 /// Our own glue kernels, which every launch takes when no captured set is loaded
 pub const Glue = glue_.Glue;
@@ -229,6 +231,12 @@ pub const Tri = struct {
         }, &.{ ci("N", n), ci("K", k), ci("D", dims), ci("SS", streams), ci("BM", 16), ci("DB", 32), ci("GPI", 2), ci("SBN", 64) });
     }
 
+    /// hcUpmix keeping the up rows `up` the mix read, on our glue only: a captured set's _qmm_upmix keeps none.
+    pub fn hcUpmixUp(t: Tri, act: u64, xs: u64, weight: u64, scales: u64, biases: u64, normed: u64, mixed: u64, xs_mixed: u64, up: u64, rows: usize, n: usize, k: usize, dims: usize, streams: usize) !void {
+        const g = t.glue("_qmm_upmix") orelse return error.TrainingOnCapturedGlue;
+        return g.hcUpmixUp(t.s, act, xs, weight, scales, biases, normed, mixed, xs_mixed, up, rows, n, k, dims, streams);
+    }
+
     /// qmm.hc_down for one decode row. N=324 is the layer down stacked with inject. M folds when it is 1.
     pub fn hcDown(t: Tri, h: u64, pss: u64, scale: u64, normed: u64, weight: u64, scales: u64, biases: u64, out: u64, part: u64, eps: f32, rows: usize, n: usize, k: usize, dims: usize, nc: usize, streams: usize, sk: usize) !void {
         if (t.glue("_qmm_hcdown")) |g| return g.hcDown(t.s, h, pss, scale, normed, weight, scales, biases, out, part, eps, rows, n, k, dims, nc, streams, sk);
@@ -358,6 +366,7 @@ test {
     _ = row_path;
     _ = @import("cuda_mtp_check.zig");
     _ = fn_back;
+    _ = pocket;
 }
 
 test "embed grid is one program per row and per group of 32" {

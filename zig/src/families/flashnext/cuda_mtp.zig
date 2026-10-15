@@ -179,7 +179,7 @@ pub const Head = struct {
             var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
             defer pack_mod.unload();
             const pack_fn = try pack_mod.function(wt.pack_symbol);
-            h.layer = try load.loadLayerAt(gpa, driver, stream, &store, pack_fn, "language_model.mtp.layers.0", false, false);
+            h.layer = try load.loadLayerAt(gpa, driver, stream, &store, pack_fn, "language_model.mtp.layers.0", false, false, null);
         }
         errdefer h.layer.free(gpa);
         h.ids = try draftIds(gpa);

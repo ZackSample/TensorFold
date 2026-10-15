@@ -43,6 +43,8 @@ pub const pss_n = (dims / 256) * streams;
 pub const proj_row = @max(gdn.proj_width, proj_n);
 /// Attention rows a _chunks launch takes (its scratch: rows x nch x heads x dim fp32).
 pub const att_rows: usize = 256;
+/// Neurons a pocket's activations take a row (fn_back's max_pocket).
+pub const pocket_stride: usize = 128;
 /// Rows a pass holds at most unless asked for more.
 pub const default_chunk: usize = 1536;
 const ratio = wt.index_ratio;
@@ -65,18 +67,56 @@ fn cdiv(a: usize, b: usize) usize {
 /// Which rows get the head: the last (a prompt), every row (a verify window or a round), or none.
 pub const Logits = enum { last, all, none };
 
-/// A DeltaNet layer's window keep: projection rows, conv history before the chunk, and where its end state goes.
+/// A read-out's kept tensors (fn_back's HcKept): h and normed [rows, wide], v fp32 [rows, low (+ 4)], up, inject.
+pub const HcKeep = struct { h: u64 = 0, normed: u64 = 0, v: u64 = 0, up: u64 = 0, inject: u64 = 0 };
+
+/// A layer's kept tensors, row strides their own widths; 0 leaves one out.
 pub const LayerKeep = struct {
+    /// DeltaNet: projection rows [rows, proj] and the conv history before the chunk.
     proj: u64 = 0,
     hist: u64 = 0,
     /// The chain's end state goes here, the sequence's own left as before the chunk; 0: in place.
     state_out: u64 = 0,
+    attn_hc: HcKeep = .{},
+    mlp_hc: HcKeep = .{},
+    /// The mixer's and the MoE's branches [rows, dims] bf16 as the write-backs add them (the MoE's with its pocket).
+    mix_branch: u64 = 0,
+    moe_branch: u64 = 0,
+    /// The MoE layer (fn_back's MoeKept): its input [rows, dims] bf16, experts and weights [rows, 11].
+    moe_x: u64 = 0,
+    moe_ids: u64 = 0,
+    moe_wts: u64 = 0,
+    /// Attention (fn_back's AttnKept): q|gate, k and v projections, and o_proj's input, bf16.
+    pq: u64 = 0,
+    pk: u64 = 0,
+    pv: u64 = 0,
+    gated: u64 = 0,
 };
 
-/// What a drafted window keeps for its rollback (cuda_mtp.zig): each DeltaNet layer's rows and states.
+/// What a pass keeps: a drafted window's rollback (cuda_mtp.zig), or a training pass's tensors with the final mixer's.
 pub const Keep = struct {
     layers: [layers_n]LayerKeep = @splat(.{}),
+    mixer: HcKeep = .{},
 };
+
+/// A sequence of a training pass (Pass.spans): its first row and its rows.
+pub const Span = struct { at: usize, rows: usize };
+
+/// Adds to a layer's fp32 MoE output `out` [rows, dims] (the slots' sum) before its rounding, from its input and slots.
+pub const MoeAdd = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void,
+    /// A bit a layer it adds to; the others write back as without it.
+    layers: u64 = std.math.maxInt(u64),
+
+    pub fn at(m: MoeAdd, layer: usize) bool {
+        return m.layers >> @intCast(layer) & 1 != 0;
+    }
+};
+
+comptime {
+    std.debug.assert(layers_n <= 64); // MoeAdd.layers holds a bit a layer
+}
 
 /// A caller's view into the pass. Without any, the pass is the server's prompt pass.
 pub const Hooks = struct {
@@ -86,6 +126,8 @@ pub const Hooks = struct {
     keep: ?*Keep = null,
     /// Device [rows, wide] bf16: every row's streams after the last MoE write-back (the MTP head's input); 0: none.
     streams: u64 = 0,
+    /// A training pass's adds to each layer's MoE output, in place of the model's own (Model.pocket).
+    moe_add: ?MoeAdd = null,
 };
 
 /// The kernels the pass launches besides the captured Triton ones, loaded once.
@@ -103,6 +145,8 @@ pub const Kernels = struct {
     chain_to: cuda.Function,
     gnorm: cuda.Function,
     sum: cuda.Function,
+    moe_sum: cuda.Function,
+    copy_cols: cuda.Function,
     shift: cuda.Function,
     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
     select: cuda.Function,
@@ -123,6 +167,8 @@ pub const Kernels = struct {
         k.router = try cuda.grouped.Router.resolve(k.experts);
         k.moe = try cuda.experts.RowsExperts.resolve(k.rows);
         k.sum = try k.batch.function("fn_sum_slices");
+        k.moe_sum = try k.batch.function("fn_moe_sum");
+        k.copy_cols = try k.batch.function("fn_copy_cols");
         k.shift = try k.batch.function("fn_shift_window");
         k.select = try k.batch.function("fn_qsa_select");
         k.front = try k.batch.function("fn_gdn_front");
@@ -237,6 +283,9 @@ pub const Scratch = struct {
     moe_act: u64 = 0,
     y: u64 = 0,
     branch: u64 = 0,
+    /// A layer's MoE output in fp32 [cap, dims] when something adds to it, and the pocket's activations [cap, 128].
+    moe_f32: u64 = 0,
+    pocket_act: u64 = 0,
     ple_emb: u64 = 0,
     ple_xs: u64 = 0,
     ple_keys: u64 = 0,
@@ -315,6 +364,7 @@ pub const Scratch = struct {
         n += pairs * moe_w * 2 + pairs * dims * 4 + cap * dims * 2;
         n += cap * dims * 2 + cap * (dims / 32) * 4 + cap * wide * 2 + cap * dims * 2 + 4 * cap * dims * 4;
         n += cap * wide * 2 * 2 + cap * streams * 4 + vocab * 2 + half * 4 + 4096;
+        n += cap * dims * 4 + cap * pocket_stride * 4;
         return n;
     }
 
@@ -368,6 +418,8 @@ pub const Scratch = struct {
         s.moe_act = try s.add(gpa, d, pairs * moe_w * 2);
         s.y = try s.add(gpa, d, pairs * dims * 4);
         s.branch = try s.add(gpa, d, cap * dims * 2);
+        s.moe_f32 = try s.add(gpa, d, cap * dims * 4);
+        s.pocket_act = try s.add(gpa, d, cap * pocket_stride * 4);
         s.ple_emb = try s.add(gpa, d, cap * dims * 2);
         s.ple_xs = try s.add(gpa, d, cap * (dims / 32) * 4);
         s.ple_keys = try s.add(gpa, d, cap * wide * 2);
@@ -441,6 +493,39 @@ pub const Model = struct {
     mixer: HcW,
     head: Q4,
     ngram: *const ple.Ngram,
+    /// The engine's own adds to the MoE outputs: a taught folder's pockets (null: none).
+    pocket: ?MoeAdd = null,
+};
+
+/// The rows' n-gram embeddings, gathered on a host thread while the GPU embeds and runs layer 0.
+pub const Gather = struct {
+    ngram: *const ple.Ngram,
+    history: []i64,
+    ids: []const u32,
+    emb: []u16,
+    xs: []f32,
+    failed: ?anyerror = null,
+    ns: i96 = 0,
+    io: std.Io,
+    /// A round's rows, each gathered after its own stream's history (empty: every row after `history`).
+    lanes: []const Lane = &.{},
+
+    pub fn main(g: *Gather) void {
+        const t0 = std.Io.Clock.awake.now(g.io).toNanoseconds();
+        defer g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
+        if (g.lanes.len == 0) {
+            g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
+                g.failed = err;
+            };
+            return;
+        }
+        for (g.lanes, 0..) |l, r| {
+            g.ngram.rows(l.seq.history[0..], g.ids[r..][0..1], g.emb[r * dims ..][0..dims], g.xs[r * (dims / 32) ..][0 .. dims / 32]) catch |err| {
+                g.failed = err;
+                return;
+            };
+        }
+    }
 };
 
 /// A stand-in for the stream: which copies are still queued, and a failure at a chosen copy or at the record.

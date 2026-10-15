@@ -14,6 +14,24 @@ extern "C" __global__ void fn_sum_slices(const float* __restrict__ part, void* _
     else reinterpret_cast<float*>(out)[i] = acc;
 }
 
+// A row's MoE output in fp32: _hc_writeback's MODE 2 sum (slots in order, fma) before its rounding. Grid (rows, d/256).
+extern "C" __global__ void fn_moe_sum(const float* __restrict__ y, const float* __restrict__ wts, float* __restrict__ out,
+                                      int d, int slots) {
+    const int r = blockIdx.x, col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= d) return;
+    float acc = 0.0f;
+    for (int k = 0; k < slots; ++k)
+        acc = __fmaf_rn(y[(static_cast<long long>(r) * slots + k) * d + col], wts[r * slots + k], acc);
+    out[static_cast<long long>(r) * d + col] = acc;
+}
+
+// dst [rows, width] (rows dst_pitch apart) = the columns src [rows, width] (src_pitch apart), 16-bit values.
+extern "C" __global__ void fn_copy_cols(const uint16_t* __restrict__ src, long long src_pitch, uint16_t* __restrict__ dst,
+                                        long long dst_pitch, int width) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (col < width) dst[r * dst_pitch + col] = src[r * src_pitch + col];
+}
+
 // Shifts the last-`taps`-rows window [taps, c] in place past `rows`, n rows `stride` apart (conv history, n-gram tail).
 extern "C" __global__ void fn_shift_window(__nv_bfloat16* __restrict__ win, const __nv_bfloat16* __restrict__ rows,
                                            long long stride, int n, int taps, int c) {

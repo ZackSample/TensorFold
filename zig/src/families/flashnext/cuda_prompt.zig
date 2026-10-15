@@ -8,6 +8,8 @@ const ple = @import("cuda_ple.zig");
 const weights = @import("cuda_prompt_wt.zig");
 const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
+const fb = @import("cuda_fn_back.zig");
+const pocket = @import("cuda_pocket.zig");
 
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
@@ -133,6 +135,8 @@ pub const Engine = struct {
     scores: ?cuda.DeviceBuffer = null,
     /// Rows a batched chunk takes at most (TF_FLASHNEXT_CHUNK; batch.default_chunk by default).
     chunk: usize,
+    /// Each layer's Living Weights pocket, from a taught folder's shards or the learner: every pass adds it.
+    pockets: pocket.Pockets = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -167,10 +171,22 @@ pub const Engine = struct {
         var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
         defer pack_mod.unload();
         const pack_fn = try pack_mod.function(weights.pack_symbol);
+        e.pockets = .{};
+        errdefer e.pockets.deinit();
+        const rows = try gpa.alloc(f32, 3 * fb.max_pocket * dims);
+        defer gpa.free(rows);
+        var learned: usize = 0;
         for (0..layers_n) |i| {
-            e.layers[i] = try loadLayer(gpa, driver, stream, &e.store, pack_fn, i);
+            const cap = fb.max_pocket * dims;
+            var pk: load.Pocket = .{ .gate = rows[0..cap], .up = rows[cap..][0..cap], .down = rows[2 * cap ..][0..cap] };
+            e.layers[i] = try loadLayer(gpa, driver, stream, &e.store, pack_fn, i, &pk);
             e.n_layers += 1;
+            if (pk.n == 0) continue;
+            const used = pocket.usedOf(pk.up, pk.n);
+            try e.pockets.set(driver, stream, i, pk.gate[0 .. pk.n * dims], pk.up[0 .. pk.n * dims], pk.down[0 .. pk.n * dims], used);
+            learned += used;
         }
+        if (learned > 0) std.log.info("flashnext: the folder's Living Weights pockets hold {d} learned neurons beside the shared experts", .{learned});
         e.store.release();
         e.store.closeFile();
         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
@@ -185,6 +201,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.pockets.deinit();
         if (e.batch_s) |*bs| bs.free(e.gpa);
         if (e.scores) |*b| b.free();
         e.batch_k.deinit();
@@ -196,6 +213,39 @@ pub const Engine = struct {
         e.store.deinit();
         e.gpa.free(e.model_dir);
         e.gpa.destroy(e);
+    }
+
+    /// Layer `layer`'s pocket for every pass: gate rows, up rows and outputs fp32 [n, dims], the first `used` live.
+    pub fn setPocket(e: *Engine, layer: usize, gate: []const f32, up: []const f32, down: []const f32, used: usize) !void {
+        try e.pockets.set(e.driver, e.stream, layer, gate, up, down, used);
+    }
+
+    /// Layer `layer`'s pocket into gate, up and down ([n, dims] each); the neurons in use (0: none).
+    pub fn pocketRead(e: *Engine, layer: usize, gate: []f32, up: []f32, down: []f32) usize {
+        return e.pockets.read(e.stream, layer, gate, up, down);
+    }
+
+    /// Layer `layer`'s pocket as the kernels take it, or null with no neuron in use.
+    pub fn pocketOf(e: *const Engine, layer: usize) ?fb.Ops.Pocket {
+        return e.pockets.of(layer, if (e.batch_s) |bs| bs.pocket_act else 0);
+    }
+
+    /// The pocket's kernels on the engine's stream (loaded with the first pocket).
+    pub fn pocketOps(e: *const Engine) ?fb.Ops {
+        return if (e.pockets.k) |*k| .{ .k = k, .s = e.stream.* } else null;
+    }
+
+    /// Every pass's adds to the MoE outputs: each taught layer's pocket behind its shared gate.
+    fn servePocket(ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        const pk = e.pocketOf(layer) orelse return;
+        try e.pocketOps().?.pocketRows(pk, .{ .x = x, .ids = ids, .wts = wts }, out, true, rows, dims, slots - 1);
+    }
+
+    /// The resident weights a pass reads, with the taught layers' pockets.
+    pub fn model(e: *Engine) batch.Model {
+        const m = e.pockets.mask();
+        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
     }
 
     /// A fresh cache. `cap` is how many tokens it can hold, prompt plus generated.
@@ -276,7 +326,7 @@ pub const Engine = struct {
             .tri = tri,
             .k = &e.batch_k,
             .s = s,
-            .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
+            .m = e.model(),
             .seq = seq.view(scores),
             .hooks = hooks,
         };
@@ -314,7 +364,7 @@ pub const Engine = struct {
             .tri = tri,
             .k = &e.batch_k,
             .s = s,
-            .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram },
+            .m = e.model(),
             .seq = rows[0].seq,
             .lanes = rows,
             .hooks = .{ .logits = .all, .logits_out = out },
