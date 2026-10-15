@@ -39,6 +39,7 @@ pub const sample = @import("sample.zig");
 pub const modelopt = @import("modelopt.zig");
 pub const gdn_train = @import("gdn_train.zig");
 pub const train_q4 = @import("train_q4.zig");
+pub const train_attn = @import("train_attn.zig");
 
 test {
     _ = @import("memory.zig");
@@ -60,4 +61,5 @@ test {
     _ = @import("modelopt.zig");
     _ = @import("gdn_train.zig");
     _ = @import("train_q4.zig");
+    _ = @import("train_attn.zig");
 }
