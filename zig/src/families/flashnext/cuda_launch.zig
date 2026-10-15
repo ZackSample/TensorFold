@@ -23,6 +23,8 @@ pub const mtp = @import("cuda_mtp.zig");
 pub const fn_back = @import("cuda_fn_back.zig");
 /// Each layer's Living Weights pocket in the forward
 pub const pocket = @import("cuda_pocket.zig");
+/// Living Weights' trainer over the batched pass
+pub const train = @import("cuda_train.zig");
 pub const native = @import("cuda_lanes.zig").Namespace(Tri);
 /// Our own glue kernels, which every launch takes when no captured set is loaded
 pub const Glue = glue_.Glue;
@@ -367,6 +369,7 @@ test {
     _ = @import("cuda_mtp_check.zig");
     _ = fn_back;
     _ = pocket;
+    _ = train;
 }
 
 test "embed grid is one program per row and per group of 32" {
