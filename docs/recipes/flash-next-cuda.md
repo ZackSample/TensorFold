@@ -22,8 +22,10 @@ tensorfold-native serve /path/to/checkpoint --temperature 0
   not loaded.
 - It refuses another quantization, other shapes, and semantic settings its kernels fix (RMS epsilon, RoPE base, rotated
   share, type and scaling, the gate and activation types, attention bias, the layer roles, the n-gram layer, kernel
-  and dilation): config.json is checked at load and the log names the field. It also refuses `--segments`, `--slide`
-  and a folder whose shared experts carry Living Weights neurons.
+  and dilation): config.json is checked at load and the log names the field. It also refuses `--segments`.
+- A folder Living Weights taught serves with its pocket (the learned neurons beside each shared expert) in every pass,
+  and `--slide` learns into a copy on a GB10 ([Living Weights](../living-weights.md)); the trainer keeps 10.6 GiB
+  beside the model. A captured comparison set refuses `--slide`: its read-out keeps no up rows for the backward.
 - `TENSORFOLD_CUDA_KERNELS=DIR` swaps the glue for a captured set (see [A captured set](#a-captured-set)) when the set
   holds every entry point the engine launches; a set without them (Nemotron's, say) is passed over, and the startup
   line says which glue runs. With a set loaded, `TF_FLASHNEXT_OWNED` (`all`, or Triton names such as
