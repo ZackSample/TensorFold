@@ -8,6 +8,9 @@ const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const snap = @import("cuda_snap.zig");
 const Glue = @import("cuda_glue.zig").Glue;
+const living = @import("living");
+const slide_mod = @import("cuda_slide.zig");
+const train = @import("cuda_train.zig");
 
 const be = lanes.backend;
 const ring = 1024;
@@ -44,6 +47,18 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
+        /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
+        pub const slide = slide_mod.Slide(Tri);
+
+        /// The first file a lesson would rewrite through a link, or null: a teaching copy may hard-link the others.
+        pub const linked = slide_mod.linked;
+
+        /// What a learner over the loaded engine `p` learns into; `dir` must outlive it.
+        pub fn learnModel(p: *anyopaque, dir: []const u8) slide.Model {
+            const own: *Cuda = @ptrCast(@alignCast(p));
+            return .{ .e = own.engine, .tri = own.tri(), .dir = dir, .lay = own.lay };
+        }
+
         /// One stream's prompt-and-reply driver, as native/cuda.zig types it; this family has none.
         pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
@@ -79,6 +94,7 @@ pub fn Namespace(comptime Tri: type) type {
                 error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
                 error.UnsupportedCheckpoint => "Flash Next on CUDA serves MLX affine 4-bit group-32 Qwen3.8-Flash-Next checkpoints; the log names the config field that differs",
                 error.PocketOfAnotherSize => "a lesson's pocket is wider than the layer's loaded one: restart the server on the folder",
+                error.TrainingOnCapturedGlue => "--slide trains on Flash Next's own glue: serve it without TENSORFOLD_CUDA_KERNELS",
                 else => null,
             };
         }
@@ -110,6 +126,8 @@ pub fn Namespace(comptime Tri: type) type {
             logits: cuda.DeviceBuffer,
             drawn: [ring]u32 = undefined,
             next: u64 = 0,
+            /// --slide: the pocket's layout, from config.json at load.
+            lay: living.Layout = undefined,
 
             fn tri(self: *Cuda) Tri {
                 return .{ .set = if (self.set) |*x| x else null, .own = &self.glue, .s = self.stream };
@@ -248,7 +266,7 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
             if (o.context > prompt.max_tokens) return error.ContextOverWindow;
-            if (o.segments != 1 or o.slide) return error.UnsupportedOption;
+            if (o.segments != 1) return error.UnsupportedOption;
             try @import("cuda_config.zig").check(gpa, io, dir);
             const driver: *cuda.Driver = @constCast(ctx.d);
             const own = try gpa.create(Cuda);
@@ -261,10 +279,12 @@ pub fn Namespace(comptime Tri: type) type {
             // a captured set replaces our glue, for comparison, when it holds every entry point this engine launches
             if (captured) |kernels| own.set = try comparison(gpa, io, driver, ctx, kernels, o.drafts);
             errdefer if (own.set) |*x| x.deinit();
+            // a lesson's pass keeps the up rows our glue's read-out makes, which a captured set's does not
+            if (o.slide and own.set != null) return error.TrainingOnCapturedGlue;
             own.engine = try prompt.Engine.init(gpa, io, driver, &own.stream, dir);
             errdefer own.engine.deinit();
-            // the pass's scratch for a full chunk, once for the engine (every prompt, window, round and head pass)
-            _ = try own.engine.reserve(@min(o.context, own.engine.chunk));
+            // the pass's scratch for a full chunk, once for the engine; --slide: and for the trainer's pack of rows
+            _ = try own.engine.reserve(@max(@min(o.context, own.engine.chunk), if (o.slide) @as(usize, train.pack_rows) else 0));
             // the MTP head unless --no-drafts (TF_FLASHNEXT_DRAFTS and _CONFIDENCE: the chain's rule, 6 and 0.60)
             if (o.drafts) {
                 own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
@@ -279,6 +299,7 @@ pub fn Namespace(comptime Tri: type) type {
             errdefer own.logits.free();
             own.lanes = .empty;
             own.next = 0;
+            if (o.slide) own.lay = try slide_mod.layoutOf(gpa, io, dir);
             var stream_bytes = prompt.seqBytes(window);
             if (own.head) |h| stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk);
             return .{
@@ -288,6 +309,8 @@ pub fn Namespace(comptime Tri: type) type {
                 .stream_bytes = stream_bytes,
                 .ctx = own,
                 .deinit = release,
+                .learns = if (o.slide) own else null,
+                .learn_bytes = if (o.slide) train.memory() else 0,
                 .target = own,
                 .own_glue = own.set == null,
             };

@@ -115,7 +115,7 @@ pub const Layout = struct {
 };
 
 test "a family finds its shared expert's layer in a tensor name and builds its prefix" {
-    const f = @import("test_families.zig").swiglu;
+    const f = @import("families.zig").qwen4_exp;
     try f.check();
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.shared_expert.", try f.expertBase(&buf, 7));

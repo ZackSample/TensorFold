@@ -370,6 +370,7 @@ test {
     _ = fn_back;
     _ = pocket;
     _ = train;
+    _ = @import("living.zig");
 }
 
 test "embed grid is one program per row and per group of 32" {

@@ -211,5 +211,5 @@ test "a pocket lesson over a stand-in relu^2 host: read, fitted, stepped, judged
 }
 
 test "a pocket lesson over a stand-in gated SwiGLU host: its rows handed over as gate sharp u and up u / sharp, the gate read" {
-    try run(@import("test_families.zig").swiglu);
+    try run(@import("families.zig").qwen4_exp);
 }

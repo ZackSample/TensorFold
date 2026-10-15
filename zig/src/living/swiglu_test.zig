@@ -5,7 +5,7 @@ const neuron = @import("neuron.zig");
 const affine = @import("affine.zig");
 const families = @import("families.zig");
 
-const f = @import("test_families.zig").swiglu;
+const f = @import("families.zig").qwen4_exp;
 const d = 128;
 
 fn bf(x: f32) u16 {
