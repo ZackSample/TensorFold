@@ -19,6 +19,8 @@ pub const prompt = @import("cuda_prompt.zig");
 pub const row_path = @import("cuda_rows.zig");
 /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
 pub const mtp = @import("cuda_mtp.zig");
+/// The input gradients Living Weights trains through: the hyper-connections, the pocket and the core's layers
+pub const fn_back = @import("cuda_fn_back.zig");
 pub const native = @import("cuda_lanes.zig").Namespace(Tri);
 /// Our own glue kernels, which every launch takes when no captured set is loaded
 pub const Glue = glue_.Glue;
@@ -355,6 +357,7 @@ test {
     _ = @import("cuda_config.zig");
     _ = row_path;
     _ = @import("cuda_mtp_check.zig");
+    _ = fn_back;
 }
 
 test "embed grid is one program per row and per group of 32" {
