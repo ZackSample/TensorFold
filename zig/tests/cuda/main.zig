@@ -29,6 +29,7 @@ const norms_tests = @import("norms_tests.zig");
 const norm_rows_tests = @import("norm_rows_tests.zig");
 const pocket_tests = @import("pocket_tests.zig");
 const recapture_tests = @import("recapture_tests.zig");
+const gdn_back_tests = @import("gdn_back_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -69,6 +70,8 @@ const usage =
     \\  exlr8-bench DIR [MANIFEST] [LAYER] [SETS]   a real EXLR8 layer: FP64, row windows, then GB/s by stage
     \\  exlr8-dense [DIR]         EXLR8 dense formats: decode bit-equal, FP64, row windows; DIR adds the real matrices
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+    \\  gdn-back                  Living Weights' DeltaNet backward against float64 references (synthetic)
+    \\  gdn-back-27b              the same DeltaNet backward at the 27B's shapes (hidden 5120, group-64 projections)
     \\
 ;
 
@@ -146,6 +149,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
+    if (std.mem.eql(u8, cmd, "gdn-back")) return gdn_back_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "gdn-back-27b")) return gdn_back_tests.runShape(gpu, 5120, 64);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
 }
