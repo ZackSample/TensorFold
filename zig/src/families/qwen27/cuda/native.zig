@@ -11,6 +11,9 @@ const dr = @import("draft.zig");
 const vision = @import("vision.zig");
 const image = @import("image.zig");
 const reuse = @import("reuse.zig");
+const living = @import("living");
+const slide_mod = @import("slide.zig");
+const train = @import("train.zig");
 
 pub const model_type = "qwen3_5";
 pub const formats: []const []const u8 = &.{"mlx-q4g64"};
@@ -34,7 +37,19 @@ pub fn useCache(p: *anyopaque) void {
     own.e.grid = true;
 }
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null, kv8: bool = false };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null, kv8: bool = false, slide: bool = false };
+
+/// Living Weights' learner (--slide): lessons put neurons in the pocket beside each layer's dense MLP.
+pub const slide = slide_mod;
+
+/// The first file a lesson would rewrite through a link (config.json, the index, a shard holding an MLP), or null.
+pub const linked = slide_mod.linked;
+
+/// What a learner over the loaded engine `p` learns into; `dir` must outlive it.
+pub fn learnModel(p: *anyopaque, dir: []const u8) slide.Model {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    return .{ .e = own.e, .dir = dir, .lay = own.lay };
+}
 
 /// --vision's limits: the visual tokens a request's images share, and its images.
 pub const Vision = struct { image_tokens: u32, max_images: u32 };
@@ -60,7 +75,8 @@ pub const Loaded = struct {
     stream_bytes: usize,
     /// Streams that allocate nothing (none here: every stream's state is its own).
     free_streams: u32 = 0,
-    /// What a --slide trainer keeps out of the streams' room (none: the 27B does not learn on CUDA yet).
+    /// --slide: the engine its learner trains, and what its trainer allocates, kept out of the streams' room.
+    learns: ?*anyopaque = null,
     learn_bytes: usize = 0,
     /// What the image tower keeps out of the streams' room (--vision): one call's scratch and a request's rows.
     vision_bytes: usize = 0,
@@ -70,7 +86,7 @@ pub const Loaded = struct {
     target: *reuse.Target, // what the prompt cache copies (reuse.zig)
 };
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, target: reuse.Target = undefined, draft: ?*dr.DFlash2 = null, tower: ?*vision.Tower = null };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, target: reuse.Target = undefined, draft: ?*dr.DFlash2 = null, tower: ?*vision.Tower = null, lay: living.Layout = undefined };
 
 /// The drafter the Python engine pairs with the 27B once pulled (z-lab/Qwen3.8-27B-DFlash2).
 const drafter_repo = "models--z-lab--Qwen3.8-27B-DFlash2";
@@ -108,6 +124,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, most_streams) };
     errdefer own.lanes.deinit();
     own.target = .{ .e = e, .seqs = &own.lanes.seqs };
+    if (o.slide) own.lay = try slide_mod.layoutOf(gpa, io, dir);
     if (o.drafts) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
         defer gpa.free(draft_dir);
         const f = e.forward();
@@ -132,6 +149,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         // each stream's caches, its drafter context, and its share of a round's attention partials (`fit`)
         .stream_bytes = st.Seq.bytes(e.w.g, o.context, o.kv8) + st.Scratch.partialBytes(e.w.g, st.Scratch.streamPartRows(o.context)) + if (own.draft != null) dr.Context.bytes() else 0,
         .vision_bytes = vision_bytes,
+        .learns = if (o.slide) own else null,
+        .learn_bytes = if (o.slide) train.memory(e.w.g) else 0,
         .ctx = own,
         .deinit = release,
         .target = &own.target,

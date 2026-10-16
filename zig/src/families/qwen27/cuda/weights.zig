@@ -7,6 +7,7 @@ const source = @import("nemotron").source;
 const c = @import("shape.zig");
 const config_eos = @import("../config.zig").max_eos;
 const kern = @import("kernels.zig");
+const pocket_mod = @import("pocket.zig");
 
 pub const QLinear = kern.QLinear;
 const Tensor = core.checkpoint.Tensor;
@@ -30,8 +31,20 @@ pub const Weights = struct {
     eos: [config_eos]u32 = undefined, // config.json's end tokens, then generation_config.json's
     eos_count: usize = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    /// A taught folder's pocket, as its widened shards hold it (by layer; empty: none), until the engine takes it.
+    pocket: []?pocket_mod.Host = &.{},
+    pocket_rows: []f32 = &.{},
+
+    /// The pocket's host rows, once the engine holds them on the device.
+    pub fn dropPocket(w: *Weights) void {
+        w.gpa.free(w.pocket_rows);
+        w.gpa.free(w.pocket);
+        w.pocket_rows = &.{};
+        w.pocket = &.{};
+    }
 
     pub fn deinit(w: *Weights) void {
+        w.dropPocket();
         for (w.buffers.items) |*b| b.free();
         w.buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
@@ -105,21 +118,35 @@ const Loader = struct {
 
     /// qmm_fast.tile: MLX words, scales and biases packed into the lane matmul's tiled layout.
     fn tile(L: *Loader, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !QLinear {
-        var parts: [3]Tensor = undefined;
-        var buf: [192]u8 = undefined;
-        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| parts[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ prefix, name, s }));
+        var t: [3]Tensor = undefined;
+        try L.parts(ck, name, n, k, &t);
         const k8 = k / 8;
         const kg = k / 64;
-        if (parts[0].dtype != .u32 or parts[1].dtype != .bf16 or parts[2].dtype != .bf16) return error.UnsupportedQuantization;
-        if (!parts[0].is(.u32, &.{ n, k8 }) or !parts[1].is(.bf16, &.{ n, kg }) or !parts[2].is(.bf16, &.{ n, kg })) {
-            std.log.err("{s}: not a 4-bit group-64 ({d}, {d}) projection", .{ name, n, k });
-            return error.UnexpectedTensor;
-        }
-        const npad = (n + 127) / 128 * 128;
         const sizes = [3]usize{ n * k8 * 4, n * kg * 2, n * kg * 2 };
         const base = try L.tmp(sizes[0] + sizes[1] + sizes[2]);
         const at = [3]usize{ 0, sizes[0], sizes[0] + sizes[1] };
-        for (0..3) |j| try L.src.upload(base + at[j], parts[j].bytes);
+        for (0..3) |j| try L.src.upload(base + at[j], t[j].bytes);
+        return L.pack(base, n, k);
+    }
+
+    /// A projection's words, scales and biases, held to a 4-bit group-64 (n, k) projection.
+    fn parts(L: *Loader, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize, out: *[3]Tensor) !void {
+        _ = L;
+        var buf: [192]u8 = undefined;
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| out[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ prefix, name, s }));
+        if (out[0].dtype != .u32 or out[1].dtype != .bf16 or out[2].dtype != .bf16) return error.UnsupportedQuantization;
+        if (!out[0].is(.u32, &.{ n, k / 8 }) or !out[1].is(.bf16, &.{ n, k / 64 }) or !out[2].is(.bf16, &.{ n, k / 64 })) {
+            std.log.err("{s}: not a 4-bit group-64 ({d}, {d}) projection", .{ name, n, k });
+            return error.UnexpectedTensor;
+        }
+    }
+
+    /// The words, scales and biases at `base` (as stored, rows of k inputs) packed into a new tiled projection.
+    fn pack(L: *Loader, base: u64, n: usize, k: usize) !QLinear {
+        const k8 = k / 8;
+        const kg = k / 64;
+        const npad = (n + 127) / 128 * 128;
+        const at = [3]usize{ 0, n * k8 * 4, n * k8 * 4 + n * kg * 2 };
         const q: QLinear = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad };
         const total: u64 = @as(u64, npad / 64) * kg * 512;
         try L.src.flush();
@@ -138,6 +165,52 @@ const Loader = struct {
             try cuda.launch.launch(L.ops.k.transpose16, .{ .grid = .{ .x = @intCast((cells + 255) / 256) }, .block = .{ .x = 256 } }, L.ops.s, &t);
         }
         return q;
+    }
+
+    /// A widened MLP projection: its own first n rows and k columns tiled, the pocket's rest into `extra` (fp32).
+    fn tileWide(L: *Loader, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize, n_all: usize, k_all: usize, extra: []f32) !QLinear {
+        var t: [3]Tensor = undefined;
+        try L.parts(ck, name, n_all, k_all, &t);
+        const w8 = k_all / 8;
+        const wg = k_all / 64;
+        const sizes = [3]usize{ n * (k / 8) * 4, n * (k / 64) * 2, n * (k / 64) * 2 };
+        // the stored rows read whole (O_DIRECT through the source's slots), then cut
+        const stored = try L.gpa.alloc(u8, t[0].bytes.len + t[1].bytes.len + t[2].bytes.len);
+        defer L.gpa.free(stored);
+        const words = stored[0..t[0].bytes.len];
+        const scales = stored[t[0].bytes.len..][0..t[1].bytes.len];
+        const biases = stored[t[0].bytes.len + t[1].bytes.len ..];
+        try L.src.read(words, t[0].bytes);
+        try L.src.read(scales, t[1].bytes);
+        try L.src.read(biases, t[2].bytes);
+        const host = try L.staging(sizes[0] + sizes[1] + sizes[2]);
+        for (0..n) |r| {
+            @memcpy(host[r * (k / 8) * 4 ..][0 .. (k / 8) * 4], words[r * w8 * 4 ..][0 .. (k / 8) * 4]);
+            @memcpy(host[sizes[0] + r * (k / 64) * 2 ..][0 .. (k / 64) * 2], scales[r * wg * 2 ..][0 .. (k / 64) * 2]);
+            @memcpy(host[sizes[0] + sizes[1] + r * (k / 64) * 2 ..][0 .. (k / 64) * 2], biases[r * wg * 2 ..][0 .. (k / 64) * 2]);
+        }
+        const value = struct {
+            fn f(w: []const u8, s: []const u8, b: []const u8, cols: usize, r: usize, col: usize) f32 {
+                const word = std.mem.readInt(u32, w[(r * cols + col) / 8 * 4 ..][0..4], .little);
+                const code: f32 = @floatFromInt((word >> @intCast(4 * (col % 8))) & 0xf);
+                const g = r * (cols / 64) + col / 64;
+                return half(s, g) * code + half(b, g);
+            }
+            fn half(x: []const u8, i: usize) f32 {
+                return @bitCast(@as(u32, std.mem.readInt(u16, x[2 * i ..][0..2], .little)) << 16);
+            }
+        }.f;
+        // the pocket's rows (gate, up), or its columns (down) as a neuron's output vector a row
+        if (n_all > n) {
+            for (n..n_all) |r| for (0..k) |col| {
+                extra[(r - n) * k + col] = value(words, scales, biases, k_all, r, col);
+            };
+        } else for (0..n) |r| for (k..k_all) |col| {
+            extra[(col - k) * n + r] = value(words, scales, biases, k_all, r, col);
+        };
+        const base = try L.tmp(sizes[0] + sizes[1] + sizes[2]);
+        try L.ops.upload(base, host);
+        return L.pack(base, n, k);
     }
 
     fn vector(L: *Loader, ck: *core.Checkpoint, name: []const u8, len: usize) !u64 {
@@ -210,6 +283,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     defer ck.close();
     try src.add(&ck);
     w.layers = try gpa.alloc(Layer, g.layers);
+    const P = cfg.pocket;
+    if (P > 0) {
+        w.pocket = try gpa.alloc(?pocket_mod.Host, g.layers);
+        @memset(w.pocket, null);
+        w.pocket_rows = try gpa.alloc(f32, g.layers * 3 * P * g.hidden);
+    }
     for (w.layers, 0..) |*layer, i| {
         var pb: [64]u8 = undefined;
         var nb: [160]u8 = undefined;
@@ -221,9 +300,20 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         }.f;
         layer.input_norm = try L.vector(&ck, try join(&nb, p, "input_layernorm.weight"), g.hidden);
         layer.mixer = if (c.linear(i)) .{ .delta = try L.delta(&ck, p, g) } else .{ .attention = try L.attention(&ck, p, g) };
-        layer.gate = try L.tile(&ck, try join(&nb, p, "mlp.gate_proj"), g.intermediate, g.hidden);
-        layer.up = try L.tile(&ck, try join(&nb, p, "mlp.up_proj"), g.intermediate, g.hidden);
-        layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
+        if (P == 0) {
+            layer.gate = try L.tile(&ck, try join(&nb, p, "mlp.gate_proj"), g.intermediate, g.hidden);
+            layer.up = try L.tile(&ck, try join(&nb, p, "mlp.up_proj"), g.intermediate, g.hidden);
+            layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
+        } else {
+            // a taught folder: the MLP's own neurons tiled, the pocket's beside them for the engine
+            const at = w.pocket_rows[i * 3 * P * g.hidden ..][0 .. 3 * P * g.hidden];
+            const ph: pocket_mod.Host = .{ .gate = at[0 .. P * g.hidden], .up = at[P * g.hidden ..][0 .. P * g.hidden], .down = at[2 * P * g.hidden ..][0 .. P * g.hidden], .n = P };
+            const I = g.intermediate;
+            layer.gate = try L.tileWide(&ck, try join(&nb, p, "mlp.gate_proj"), I, g.hidden, I + P, g.hidden, ph.gate);
+            layer.up = try L.tileWide(&ck, try join(&nb, p, "mlp.up_proj"), I, g.hidden, I + P, g.hidden, ph.up);
+            layer.down = try L.tileWide(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, I, g.hidden, I + P, ph.down);
+            w.pocket[i] = ph;
+        }
         layer.post_norm = try L.vector(&ck, try join(&nb, p, "post_attention_layernorm.weight"), g.hidden);
     }
     w.embed = .{

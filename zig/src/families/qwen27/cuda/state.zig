@@ -56,6 +56,7 @@ pub const Seq = struct {
     capacity: usize,
     pos: usize = 0,
     rope_delta: i32 = 0, // an image prompt's rotary shift past its rows (decode positions are pos + rope_delta)
+    untaught: bool = false, // the model as shipped: no learned neuron acts on its rows (a lesson writer's reads)
     media: ?*const vision.Media = null, // during an image prompt's pass: its rows and positions
     gpa: std.mem.Allocator,
 
@@ -119,6 +120,28 @@ pub const Seq = struct {
         s.gpa.free(s.kscale);
         s.gpa.free(s.vscale);
         s.* = undefined;
+    }
+
+    /// This stream made `src`'s state on the device (its recurrences, conv windows and the K/V rows it read).
+    pub fn copyFrom(s: *Seq, ops: kern.Ops, g: c.Geometry, src: *const Seq) !void {
+        if (src.pos >= s.capacity or src.kv8 != s.kv8 or src.media != null) return error.BadReuse;
+        const row: usize = g.kvInner() * @as(usize, if (s.kv8) 1 else 2);
+        for (0..g.layers) |i| {
+            if (c.linear(i)) {
+                try ops.copy(s.rec[i], src.rec[i], g.deltaBytes());
+                try ops.copy(s.conv[i], src.conv[i], g.convBytes());
+                continue;
+            }
+            try ops.copy(s.keys[i], src.keys[i], src.pos * row);
+            try ops.copy(s.values[i], src.values[i], src.pos * row);
+            if (s.kv8) {
+                try ops.copy(s.kscale[i], src.kscale[i], src.pos * g.kv_heads * 4);
+                try ops.copy(s.vscale[i], src.vscale[i], src.pos * g.kv_heads * 4);
+            }
+        }
+        s.pos = src.pos;
+        s.rope_delta = src.rope_delta;
+        s.untaught = src.untaught;
     }
 
     /// Back to an empty prompt: zero recurrences and conv windows (State.__init__'s zeros).

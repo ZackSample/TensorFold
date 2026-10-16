@@ -35,6 +35,7 @@ const kernels = [_]Kernel{
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "attn_train", .flags = &.{"-O3"} }, // ours: Living Weights' gated attention backward, shared
     .{ .name = "gdn_train", .flags = &.{ "-O3", "--fmad=false" } }, // ours: Living Weights' DeltaNet backward (gdn_train.zig)
+    .{ .name = "qwen27_train", .flags = &.{"-O3"} }, // ours: the 27B's pocket, dense MLP backward and group-64 products
     .{ .name = "qwen_ops", .flags = &.{"-O3"} }, // ours: the 27B's batched state copies, taps, drafter norms and rotary
     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
@@ -150,6 +151,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("core", mods.core);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
+    runner.addImport("qwen27", mods.qwen27);
     const exlr8 = exlr8_build.coreAlias(b, target, optimize, mods.core);
     runner.addImport("exlr8", exlr8);
     const exlr8_tests = exlr8_build.testModules(b, target, optimize, exlr8);
@@ -162,6 +164,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     qwen_cli.addImport("cuda", cuda);
     qwen_cli.addImport("qwen27", mods.qwen27);
     b.installArtifact(b.addExecutable(.{ .name = "tf-qwen27-cuda", .root_module = qwen_cli }));
+    // Living Weights' trainer on the 27B, checked on the GPU (packed passes, the push, gate taps, scored replies)
+    const qwen_learn = b.createModule(.{ .root_source_file = b.path("zig/src/cli/qwen27_learn.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    qwen_learn.addImport("cuda", cuda);
+    qwen_learn.addImport("qwen27", mods.qwen27);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-qwen27-learn", .root_module = qwen_learn }));
     nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen27, mods.tokenizer, mods.living, build_options, true).root_module.strip = strip;
 }
 

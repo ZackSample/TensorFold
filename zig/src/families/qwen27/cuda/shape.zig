@@ -62,13 +62,31 @@ pub const Config = struct {
     g: Geometry,
     eos: [config.max_eos]u32,
     eos_count: usize,
+    pocket: usize = 0, // Living Weights' neurons a layer beside the MLP's own (text_config's tensorfold_learned_neurons)
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         const text = try file(gpa, io, dir, "config.json") orelse return error.MissingConfig;
         defer gpa.free(text);
         const generation = try file(gpa, io, dir, "generation_config.json");
         defer if (generation) |x| gpa.free(x);
-        return check(try config.parse(gpa, text, generation));
+        var parsed = try config.parse(gpa, text, generation);
+        // a taught folder's MLPs are wider by its pocket: the engine runs their own width and the pocket beside them
+        const pocket = try pocketOf(gpa, text);
+        if (pocket >= parsed.intermediate) return error.UnsupportedQwenGeometry;
+        parsed.intermediate -= pocket;
+        var out = try check(parsed);
+        out.pocket = pocket;
+        return out;
+    }
+
+    /// text_config's (or the top level's) tensorfold_learned_neurons, 0 when absent.
+    fn pocketOf(gpa: std.mem.Allocator, text: []const u8) !usize {
+        var doc = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+        defer doc.deinit();
+        if (doc.value != .object) return 0;
+        const scope = if (doc.value.object.get("text_config")) |t| (if (t == .object) t.object else doc.value.object) else doc.value.object;
+        const v = scope.get("tensorfold_learned_neurons") orelse return 0;
+        return if (v == .integer and v.integer >= 0) @intCast(v.integer) else error.UnsupportedQwenGeometry;
     }
 
     fn file(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) !?[]u8 {

@@ -10,6 +10,8 @@ const vision = @import("vision.zig");
 const wts = @import("weights.zig");
 const Forward = @import("forward.zig").Forward;
 const Part = @import("forward.zig").Part;
+const pocket = @import("pocket.zig");
+const hooks = @import("hooks.zig");
 
 /// prefill.CHUNK: a prompt chunk's rows (prompt_rows on a GPU of 80 GB or more).
 pub const prompt_rows = 4096;
@@ -70,6 +72,8 @@ pub const Engine = struct {
     context: usize,
     kv8: bool, // --kv-cache fp8: every stream's attention caches e4m3 with a scale a row
     grid: bool = false, // a prompt cache: prompts in zero-anchored chunks (Chunks), not even splits
+    pockets: pocket.Pockets, // Living Weights' neurons beside each layer's MLP (none until a folder or a lesson has them)
+    dir: []const u8 = "", // the checkpoint folder (the trainer reads its MLX copies there)
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -86,6 +90,29 @@ pub const Engine = struct {
         errdefer e.k.deinit();
         e.w = try wts.load(gpa, io, e.ops(), dir, cfg);
         errdefer e.w.deinit();
+        e.dir = try gpa.dupe(u8, dir);
+        errdefer gpa.free(e.dir);
+        e.pockets = try pocket.Pockets.init(gpa, ctx.d, g.hidden, g.layers);
+        errdefer e.pockets.deinit();
+        if (std.c.getenv("TF_Q27_POCKET_DECOUPLE") != null and e.w.pocket.len > 0) {
+            const norms = try gpa.alloc([]f32, g.layers);
+            defer gpa.free(norms);
+            const raw = try gpa.alloc(u16, g.hidden);
+            defer gpa.free(raw);
+            for (norms, 0..) |*n, l| {
+                n.* = try gpa.alloc(f32, g.hidden);
+                try ctx.d.check(ctx.d.api.cuMemcpyDtoH_v2(raw.ptr, e.w.layers[l].post_norm, g.hidden * 2), "cuMemcpyDtoH");
+                for (n.*, raw) |*dst, b| dst.* = @bitCast(@as(u32, b) << 16);
+            }
+            defer for (norms) |n| gpa.free(n);
+            var mean: f64 = 0;
+            for (norms[20]) |v| mean += v;
+            const share = try pocket.decouple(gpa, g.hidden, e.w.pocket, norms);
+            std.log.info("qwen27: pocket diagnostic: outputs decoupled from later neurons' reads ({d:.1}% of their squared size removed; layer 20's post norm mean {d:.3})", .{ 100 * share, mean / @as(f64, @floatFromInt(g.hidden)) });
+        }
+        const learned = try e.pockets.loadAll(e.s, e.w.pocket);
+        e.w.dropPocket();
+        if (learned > 0) std.log.info("qwen27: the folder's Living Weights pocket: {d} learned neurons beside the MLPs", .{learned});
         e.scratch = try st.Scratch.init(gpa, ctx.d, g, prompt_rows, o.context);
         errdefer e.scratch.deinit();
         try e.s.synchronize();
@@ -93,6 +120,8 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.pockets.deinit();
+        e.gpa.free(e.dir);
         e.scratch.deinit();
         e.w.deinit();
         e.k.deinit();
@@ -105,7 +134,14 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *Engine) Forward {
-        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .set = &e.k.triton, .s = e.s }, .s = &e.scratch };
+        const mlp: ?hooks.MlpAdd = if (e.pockets.any()) .{ .ctx = e, .f = servePocket } else null;
+        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .set = &e.k.triton, .s = e.s }, .s = &e.scratch, .mlp = mlp, .taught_rows = e.pockets.rowsBuffer() };
+    }
+
+    /// The serving forward's MLP hook: each layer's pocket added to its MLP's output.
+    fn servePocket(ctx: *anyopaque, layer: usize, y: u64, out: u64, rows: usize, taught: u64) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        try e.pockets.add(e.s, layer, y, out, rows, taught);
     }
 
     /// A stream's state for `capacity` positions (its caches, recurrences and conv windows), empty.

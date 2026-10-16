@@ -17,6 +17,11 @@ pub const drafts = @import("cuda/drafts.zig");
 pub const vision = @import("cuda/vision.zig");
 pub const image = @import("cuda/image.zig");
 pub const reuse = @import("cuda/reuse.zig");
+pub const train_ops = @import("cuda/train_ops.zig");
+pub const train = @import("cuda/train.zig");
+pub const tap = @import("cuda/tap.zig");
+pub const pocket = @import("cuda/pocket.zig");
+pub const slide = @import("cuda/slide.zig");
 
 test {
     _ = config;
@@ -36,4 +41,8 @@ test {
     _ = vision;
     _ = image;
     _ = reuse;
+    _ = train_ops;
+    _ = pocket;
+    _ = slide;
+    _ = @import("cuda/hooks.zig");
 }

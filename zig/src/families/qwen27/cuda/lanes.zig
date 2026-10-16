@@ -219,6 +219,7 @@ pub const Cuda = struct {
         errdefer x.gpa.destroy(seq);
         seq.* = x.e.sequence(capacity) catch |err| return if (err == error.OutOfMemory) err else error.OutOfDeviceMemory;
         errdefer seq.deinit();
+        seq.untaught = s.untaught;
         try x.seqs.put(x.gpa, s, seq);
         return seq;
     }

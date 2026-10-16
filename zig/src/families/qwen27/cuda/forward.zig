@@ -8,6 +8,7 @@ const st = @import("state.zig");
 const wts = @import("weights.zig");
 const rnd = @import("round.zig");
 const vision = @import("vision.zig");
+const hooks = @import("hooks.zig");
 
 const bf = 2;
 pub const Part = rnd.Part;
@@ -22,6 +23,10 @@ pub const Forward = struct {
     s: *st.Scratch,
     dump: ?Dump = null, // a debugging copy of every norm's (h, y) rows, as capture.py's hook writes them
     taps: ?u64 = null, // rows of the drafter's five layer taps (5 x hidden bf16), written by round and chunk
+    mlp: ?hooks.MlpAdd = null, // after each layer's MLP: a taught folder's pocket, or a training pass's (hooks.zig)
+    taught_rows: u64 = 0, // f32 [prompt_rows] device room for a call's row scales when an untaught stream rides it
+    keep: ?*const hooks.Keep = null, // a training pass's keeps and every row's logits (chunks only)
+    top: ?usize = null, // chunks: stop after this layer's MLP input is kept (a read that needs none above it; no logits)
 
     pub const Dump = struct { io: std.Io, dir: []const u8, n: usize = 0, rows: usize = 0 };
 
@@ -44,6 +49,24 @@ pub const Forward = struct {
 
     fn gpu(f: *const Forward) vision.Gpu {
         return .{ .d = f.ops.k.d, .s = f.ops.s, .discrete = f.ops.k.discrete };
+    }
+
+    /// A call's row scales for the MLP hook: 1 on a taught stream's rows, 0 on an untaught one's.
+    fn taught(f: *Forward, lens: []const usize, untaught: []const bool) !u64 {
+        if (f.mlp == null or f.taught_rows == 0) return 0;
+        if (std.mem.indexOfScalar(bool, untaught, true) == null) return 0;
+        var total: usize = 0;
+        for (lens) |n| total += n;
+        const host = try f.gpa.alloc(f32, total);
+        defer f.gpa.free(host);
+        var at: usize = 0;
+        for (lens, untaught) |n, u| {
+            @memset(host[at..][0..n], if (u) 0 else 1);
+            at += n;
+        }
+        try f.ops.upload(f.taught_rows, std.mem.sliceAsBytes(host));
+        try f.ops.s.synchronize(); // the host copy must outlive the async upload
+        return f.taught_rows;
     }
 
     fn upload32(f: *Forward, dst: u64, values: []const i32) !void {
@@ -92,6 +115,13 @@ pub const Forward = struct {
         const w = f.w;
         const r = try rnd.stage(f.gpa, f.ops, f.t, s, g_, parts);
         const W = r.rows;
+        var lens: [st.max_streams]usize = undefined;
+        var flags: [st.max_streams]bool = undefined;
+        for (parts, 0..) |p, k| {
+            lens[k] = p.tokens.len;
+            flags[k] = p.seq.untaught;
+        }
+        const taught_rows = try f.taught(lens[0..parts.len], flags[0..parts.len]);
         try f.t.embed(r.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
         var x = s.x;
         var pending: ?u64 = null;
@@ -133,6 +163,7 @@ pub const Forward = struct {
             try f.ops.dense(s.y, s.xs, layer.up, s.up, W);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
             try f.ops.dense(s.act, s.act_xs, layer.down, s.pending, W);
+            if (f.mlp) |m| try m.f(m.ctx, i, s.y, s.pending, W, taught_rows);
             pending = s.pending;
             try f.tapLayer(i, x, W);
         }
@@ -238,6 +269,7 @@ pub const Forward = struct {
         if (W < 1 or W > s.rows) return error.ChunkTooLong;
         if (seq.pos + W > seq.capacity) return error.PromptTooLong;
         const p0 = seq.pos;
+        const taught_rows = try f.taught(&.{W}, &.{seq.untaught});
         {
             const host = try f.gpa.alloc(i32, W * (2 + c.conv_taps));
             defer f.gpa.free(host);
@@ -320,6 +352,7 @@ pub const Forward = struct {
             try f.ops.prefillDense(s.y, layer.up, s.up, W);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
             try f.ops.prefillDense(s.act, layer.down, s.pending, W);
+            if (f.mlp) |m| try m.f(m.ctx, i, s.y, s.pending, W, taught_rows);
             pending = s.pending;
             try f.tapLayer(i, x, W);
         }
@@ -350,6 +383,13 @@ pub const Forward = struct {
         }
         const W = starts[S];
         if (W > s.rows) return error.ChunkTooLong;
+        var lens: [st.max_streams]usize = undefined;
+        var flags: [st.max_streams]bool = undefined;
+        for (pieces, 0..) |p, k| {
+            lens[k] = p.ids.len;
+            flags[k] = p.seq.untaught;
+        }
+        const taught_rows = try f.taught(lens[0..S], flags[0..S]);
         const keep = c.conv_taps - 1;
         const kv = g_.kvInner() * bf;
         const row = g_.convDim() * bf;
@@ -432,12 +472,14 @@ pub const Forward = struct {
         lin_n = 0;
         for (w.layers, 0..) |layer, i| {
             x = try f.norm(x, pending, layer.input_norm, W);
+            if (f.keep) |k| try k.input(i, x, W);
             switch (layer.mixer) {
                 .delta => |d| {
                     try f.ops.prefillDense(s.y, d.qkv, s.qkv, W);
                     try f.ops.prefillDense(s.y, d.z, s.z, W);
                     try f.ops.prefillDense(s.y, d.b, s.b, W);
                     try f.ops.prefillDense(s.y, d.a, s.a, W);
+                    if (f.keep) |k| try k.delta(i, s.qkv, s.z, s.b, s.a, W);
                     const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
                     try f.t.gdnPre(s.qkv, cat, d.conv, s.windows, s.sids, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
                     for (pieces, 0..) |p, k| {
@@ -454,6 +496,7 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, a.q, s.qg, W);
                     try f.ops.prefillDense(s.y, a.k, s.key, W);
                     try f.ops.prefillDense(s.y, a.v, s.prompt_values, W);
+                    if (f.keep) |k| try k.attention(i, s.qg, s.key, s.prompt_values, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
                     try f.ops.copies(s.copy_items + at_layer[i] * item, at_layer[i + 1] - at_layer[i]);
                     try f.ops.quant(s.quant_items + quant_at[i] * @sizeOf(kern.Quant), quant_at[i + 1] - quant_at[i], quant_rows);
@@ -464,18 +507,34 @@ pub const Forward = struct {
                     else
                         try f.ops.prefillAttention(s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
+                    if (f.keep) |k| try k.gated(i, s.gated, W);
                     try f.ops.prefillDense(s.gated, a.o, s.r, W);
                 },
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
+            if (f.keep) |k| try k.post(i, x, s.y, W);
+            if (f.top) |top| if (i == top) {
+                // a read of MLP inputs up to here: the layers above and the head are never read.
+                for (pieces) |p| p.seq.pos += p.ids.len;
+                try f.ops.s.synchronize();
+                return;
+            };
             try f.ops.prefillDense(s.y, layer.gate, s.gate, W);
             try f.ops.prefillDense(s.y, layer.up, s.up, W);
+            if (f.keep) |k| try k.mlp(i, s.gate, s.up, W);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
             try f.ops.prefillDense(s.act, layer.down, s.pending, W);
+            if (f.mlp) |m| try m.f(m.ctx, i, s.y, s.pending, W, taught_rows);
             pending = s.pending;
             try f.tapLayer(i, x, W);
         }
         const spare = if (x == s.x) s.h else s.x;
+        if (f.keep) |k| if (k.logits != 0) {
+            // every row's head (a training pass's loss reads them all)
+            try f.t.addRmsnorm(x, pending.?, w.norm, spare, k.last, k.last_xs, W, g_.hidden, c.eps);
+            try k.final(spare, W);
+            try f.ops.prefillDense(k.last, w.head, k.logits, W);
+        };
         for (pieces, 0..) |p, k| {
             p.seq.pos += p.ids.len;
             if (!p.last) continue;
