@@ -7,6 +7,7 @@ const pocket_fit = @import("pocket_fit.zig");
 const pack = @import("pocket_pack.zig");
 const train_mode = @import("train_mode.zig");
 const prefix = @import("pocket_prefix.zig");
+const clock = @import("pocket_clock.zig");
 
 const Example = examples.Example;
 const Acting = lesson_route.Acting;
@@ -137,7 +138,16 @@ pub fn valueOnce(p: anytype, t: anytype, host: anytype) !bool {
     const grad = s.adam.items[3 * k * d ..][0 .. k * d];
     if (s.judging) return judgeOnce(p, t, host, vals);
     if (p.answered.len == 0) return error.NoKeyedAnswers;
-    if (s.round == 0) prefix.round(p, &s.prefixes);
+    if (s.round == 0) {
+        prefix.round(p, &s.prefixes);
+        // what the neurons above each layer read, as this round's outputs are kept off it (pocket_decouple.zig)
+        if (p.decoupled) {
+            try p.above.build(p, try p.scales.get(p, t));
+            keepOff(p, vals, d);
+        }
+        // nor is an output fitted through what it makes the pocket's other neurons do.
+        if (comptime @hasField(@TypeOf(t.*), "pocket_back")) t.pocket_back = !p.decoupled;
+    }
     // usize: @min with a comptime operand narrows its type (to u4 for 8), and their sum would overflow it
     const take: usize = @min(batch, p.answered.len);
     const joins: usize = @min(joint_batch, p.joint_answers.items.len);
@@ -216,7 +226,9 @@ pub fn valueOnce(p: anytype, t: anytype, host: anytype) !bool {
             var bits = mask;
             while (bits != 0) : (bits &= bits - 1) @memset(t.deltaAt(i, key, @ctz(bits)), 0);
         };
+        const t0 = clock.mono();
         try t.pass(seqs[at..][0..m], .target, pack.turn, got[0..m]);
+        clock.add(.values_pass, clock.mono() - t0);
         for (drawn[at..][0..m], seqs[at..][0..m], got[0..m], 0..) |dr, q, r, i| {
             absorb(p, t, dr, i, r, grad);
             prefix.learn(p, t, &s.prefixes, q, t.spans[i], dr.which);
@@ -236,6 +248,7 @@ pub fn valueOnce(p: anytype, t: anytype, host: anytype) !bool {
     p.at = 0;
     s.round += 1;
     if (s.round <= value_steps) adam(s, vals, grad, k, d, take + joins + keeps);
+    if (p.decoupled) keepOff(p, vals, d);
     @memset(grad, 0);
     if (s.round % judge_every == 0 or s.round > value_steps) {
         if (p.held.len == 0) {
@@ -284,11 +297,19 @@ fn absorb(p: anytype, t: anytype, dr: Drawn, i: usize, got: Result, grad: []f32)
     // the earlier neurons on its subject, in the forward unscaled, pushed by every answer whose subject row they read
     if (masks[1] != 0) for (p.joint.items, p.taken.items.len..) |x, j| {
         const l = p.moe.items[x.slot];
-        const z = dotBf16(p.neuron(p.up.items, x.slot, x.neuron, d), t.normed(l, sp.row(rows[1])));
-        if (z <= 0) continue;
-        subspace.axpy(grad[j * d ..][0..d], z * z, t.pushAt(i, 1, l));
+        const row = sp.row(rows[1]);
+        var a = p.act(x.slot, x.neuron, t.normed(l, row));
+        if (@TypeOf(p.*).gated) a *= t.gateAt(l, row);
+        if (a == 0) continue;
+        subspace.axpy(grad[j * d ..][0..d], a, t.pushAt(i, 1, l));
         if (s.size.items[j] == 0) s.size.items[j] = normBf16(t.residual(l + 1, sp.row(rows[1])));
     };
+}
+
+/// Each output being fitted (the open fact's, then the earlier ones fitted with them) kept off what the neurons above.
+fn keepOff(p: anytype, vals: []f32, d: usize) void {
+    for (p.taken.items, 0..) |x, j| p.above.keepOff(vals[j * d ..][0..d], x.slot, d);
+    for (p.joint.items, p.taken.items.len..) |x, j| p.above.keepOff(vals[j * d ..][0..d], x.slot, d);
 }
 
 /// The fitted outputs into the pocket and the forward: the open fact's neurons, then the earlier ones fitted with them.
@@ -335,7 +356,9 @@ fn judgeOnce(p: anytype, t: anytype, host: anytype, vals: []f32) !bool {
     const s = &p.v;
     const got = try p.gpa.alloc(Result, p.held.len);
     defer p.gpa.free(got);
+    const t0 = clock.mono();
     try pack.read(p.gpa, t, p.held, .loss, got);
+    clock.add(.judge_pass, clock.mono() - t0);
     s.held_loss = 0;
     for (got) |r| s.held_loss += r.loss;
     const loss = s.held_loss / @as(f32, @floatFromInt(p.held.len));
@@ -382,6 +405,8 @@ fn finish(p: anytype, t: anytype, host: anytype, vals: []const f32) !bool {
 
 /// The held-out answers judged token for token with the pocket in the forward, side by side; true once judged.
 pub fn checkOnce(p: anytype, t: anytype, host: anytype) !bool {
+    // judged, and asked after, as a save writes it
+    try p.asWritten(t, host);
     if (p.held.len > 0) try verifyForward(p, t, host, p.held[0]);
     const got = try p.gpa.alloc(Result, p.held.len);
     defer p.gpa.free(got);

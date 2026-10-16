@@ -1,4 +1,4 @@
-//! What a family hands Living Weights: where a pocket sits, how its neurons fire, how its shards hold them.
+//! What a model family hands Living Weights: where a pocket can sit, how its neurons fire, how its shards hold them.
 const std = @import("std");
 
 /// What a pocket neuron does with its input x: relu(u x)^2 (Nemotron), or silu(g x) (w x) (a SwiGLU shared expert).
@@ -7,11 +7,11 @@ pub const Activation = enum { relu2, swiglu };
 /// A pocket neuron's kind: its activation, whether a per-row gate scales its expert's output, and its input fit.
 pub const Neuron = struct {
     act: Activation,
-    /// The shared expert's output is scaled by a gate the trainer reads at each row, so a neuron adds gate act(x) v.
+    /// The shared expert's output is scaled by a gate the trainer reads at each row.
     gated: bool = false,
     /// The input fit's margin: rows a neuron stays silent on are fitted to u x at or below -margin.
     margin: f32 = 0.25,
-    /// SwiGLU: a neuron fitted as u is written as gate row sharp * u and up row u / sharp (a power of two keeps u).
+    /// SwiGLU only: a neuron fitted as u is written as gate row sharp * u and up row u / sharp.
     sharp: f32 = 16,
 
     /// Input projections a neuron has a row in: one (up) or two (gate, then up).
@@ -106,7 +106,7 @@ pub const Layout = struct {
         return out[0..n];
     }
 
-    /// Every layer `has` names carries one widened; all but the last learn (a nudge after it has no gradient to read).
+    /// Every layer whose expert `has` says carries one widened; all but the last learn.
     pub fn fromExperts(hidden: usize, width: usize, layers: usize, has: Layers) Layout {
         var lay: Layout = .{ .hidden = hidden, .width = width, .layers = layers, .widen = has, .learn = has };
         if (layers > 0) lay.learn.unset(layers - 1);
@@ -115,7 +115,7 @@ pub const Layout = struct {
 };
 
 test "a family finds its shared expert's layer in a tensor name and builds its prefix" {
-    const f = @import("test_families.zig").swiglu;
+    const f = @import("families.zig").qwen4_exp;
     try f.check();
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.shared_expert.", try f.expertBase(&buf, 7));

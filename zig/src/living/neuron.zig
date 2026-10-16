@@ -1,4 +1,4 @@
-//! A pocket neuron's activation for each family's kind, and the gate and up rows a SwiGLU neuron is written as.
+//! A pocket neuron's activation for each family's kind, and the rows a SwiGLU neuron is written as.
 const std = @import("std");
 const Neuron = @import("family.zig").Neuron;
 

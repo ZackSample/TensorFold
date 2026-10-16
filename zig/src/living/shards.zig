@@ -1,4 +1,4 @@
-//! The pocket in the shards, for any family: every shared expert widened once (config.json told), then in place.
+//! The pocket in the shards, for any family: every shared expert widened once (config.json told).
 const std = @import("std");
 const family = @import("family.zig");
 const affine = @import("affine.zig");
@@ -10,7 +10,7 @@ pub fn Io(comptime core: type) type {
     const st = core.safetensors;
     const se = core.shard_edit;
     return struct {
-        /// The learned neurons of `layers` into `dir`'s shards, quantized as `F` stores them, handed back; the bytes.
+        /// The learned neurons of layers `layers` into `dir`'s shards (widened first if new).
         pub fn write(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, comptime F: Family, lay: Layout, layers: []const usize, neurons: usize, inputs: []const []f32, down: []f32) !usize {
             const q = F.quant;
             const d = lay.hidden;
@@ -122,7 +122,7 @@ pub fn Io(comptime core: type) type {
             }
         };
 
-        /// One shared expert with `neurons` learned after its `own`: a row a neuron per input, a column out; the bytes.
+        /// One shared expert with `neurons` learned after its `own`, into `edits`.
         fn expert(comptime F: Family, arena: std.mem.Allocator, files: *Files, edits: *std.ArrayList(se.Replacement), base: []const u8, own: usize, neurons: usize, d: usize, inputs: []const []f32, v: []f32) !usize {
             const q = F.quant;
             const g = q.group;
@@ -194,6 +194,71 @@ pub fn Io(comptime core: type) type {
             return bytes;
         }
     };
+}
+
+/// One layer's pocket rounded in place as `write` hands it back.
+pub fn roundAsWritten(comptime F: Family, gpa: std.mem.Allocator, neurons: usize, d: usize, inputs: []const []f32, down: []f32) !void {
+    const q = F.quant;
+    const per_word = 32 / q.bits;
+    const width = @max(d, neurons);
+    const w = try gpa.alloc(u32, width / per_word);
+    defer gpa.free(w);
+    const sc = try gpa.alloc(u16, width / q.group);
+    defer gpa.free(sc);
+    const bi = try gpa.alloc(u16, width / q.group);
+    defer gpa.free(bi);
+    for (inputs) |x| for (0..neurons) |k| {
+        const row = x[k * d ..][0..d];
+        affine.quantize(q, row, w[0 .. d / per_word], sc[0 .. d / q.group], bi[0 .. d / q.group]);
+        affine.dequantize(q, w[0 .. d / per_word], sc[0 .. d / q.group], bi[0 .. d / q.group], row);
+    };
+    const col = try gpa.alloc(f32, neurons);
+    defer gpa.free(col);
+    for (0..d) |o| {
+        for (col, 0..) |*x, k| x.* = down[k * d + o];
+        affine.quantize(q, col, w[0 .. neurons / per_word], sc[0 .. neurons / q.group], bi[0 .. neurons / q.group]);
+        affine.dequantize(q, w[0 .. neurons / per_word], sc[0 .. neurons / q.group], bi[0 .. neurons / q.group], col);
+        for (col, 0..) |x, k| down[k * d + o] = x;
+    }
+}
+
+test "a layer rounded as written is a fixed point, and its output groups span neighbouring neurons" {
+    const gpa = std.testing.allocator;
+    const F = @import("families.zig").qwen4_exp;
+    const n = F.neurons;
+    const d = 64;
+    var prng = std.Random.DefaultPrng.init(5);
+    const r = prng.random();
+    const gate = try gpa.alloc(f32, n * d);
+    defer gpa.free(gate);
+    const up = try gpa.alloc(f32, n * d);
+    defer gpa.free(up);
+    const down = try gpa.alloc(f32, n * d);
+    defer gpa.free(down);
+    for (gate, up) |*g, *u| {
+        g.* = r.floatNorm(f32);
+        u.* = r.floatNorm(f32) * 0.1;
+    }
+    @memset(down, 0);
+    // two neurons in one output group, one with outputs a hundred times the other's
+    for (0..d) |o| {
+        down[0 * d + o] = r.floatNorm(f32) * 0.01;
+        down[1 * d + o] = r.floatNorm(f32);
+    }
+    const small = try gpa.dupe(f32, down[0..d]);
+    defer gpa.free(small);
+    try roundAsWritten(F, gpa, n, d, &.{ gate, up }, down);
+    // the small neuron's outputs land on the big one's grid: most of them lost
+    var lost: usize = 0;
+    for (small, down[0..d]) |a, b| lost += @intFromBool(@abs(a - b) > 0.5 * @abs(a));
+    try std.testing.expect(lost > d / 4);
+    const again = try gpa.dupe(f32, down);
+    defer gpa.free(again);
+    const g2 = try gpa.dupe(f32, gate);
+    defer gpa.free(g2);
+    try roundAsWritten(F, gpa, n, d, &.{ g2, up }, again);
+    for (down, again) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    for (gate, g2) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
 }
 
 fn zeros(arena: std.mem.Allocator, n: usize) ![]f32 {

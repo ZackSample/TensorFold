@@ -1,11 +1,11 @@
-//! A SwiGLU pocket neuron on the host: fitted, written in 4-bit groups of 32 and read back, it fires as relu^2 would.
+//! A SwiGLU pocket neuron end to end on the host: fitted with Flash Next's margin.
 const std = @import("std");
 const pocket_fit = @import("pocket_fit.zig");
 const neuron = @import("neuron.zig");
 const affine = @import("affine.zig");
 const families = @import("families.zig");
 
-const f = @import("test_families.zig").swiglu;
+const f = families.qwen4_exp;
 const d = 128;
 
 fn bf(x: f32) u16 {

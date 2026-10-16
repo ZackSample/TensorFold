@@ -1,4 +1,4 @@
-//! The served model as the Living Weights view draws it: layers, pockets and shards, named as its family names them.
+//! The served model as the Sliding Weights view draws it: its layers, its pockets, and the shards that hold them.
 const std = @import("std");
 const json = @import("json.zig");
 const families = @import("living").families;
@@ -236,4 +236,33 @@ test "a folder's layers, pockets in use and shards; a save's files and bytes" {
     try std.testing.expectEqual(@as(u64, 512), w.bytes);
     const text = try json.stringify(a, try value(a, again), .{ .compact = true });
     try std.testing.expect(std.mem.indexOf(u8, text, "\"pocket\":{\"neurons\":64,\"layers\":[1,3],\"used\":[3,3]}") != null);
+}
+
+test "a Flash Next folder: every layer an MoE, its keys under text_config, the pocket read off gate_proj's rows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"qwen4_exp\", \"text_config\": {\"num_hidden_layers\": 3, \"tensorfold_learned_neurons\": 64}}" });
+    // 64 own rows and 64 pocket rows of one bf16 scale: pocket row 1 in use at layer 2, so two neurons count
+    var scales: [128 * 2]u8 = @splat(0);
+    scales[(64 + 1) * 2 + 1] = 0x3f;
+    const zeros: [128 * 2]u8 = @splat(0);
+    try writeShard(io, tmp.dir, "model-00001-of-00001.safetensors", &.{
+        .{ "language_model.model.layers.2.mlp.shared_expert.gate_proj.scales", "BF16", .{ 128, 1 }, &scales },
+        .{ "language_model.model.layers.2.mlp.shared_expert.up_proj.scales", "BF16", .{ 128, 1 }, &zeros },
+        .{ "language_model.model.layers.0.mlp.shared_expert_gate.scales", "BF16", .{ 128, 1 }, &scales },
+        .{ "language_model.mtp.layers.0.mlp.shared_expert.gate_proj.scales", "BF16", .{ 128, 1 }, &scales },
+    });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const m = try scan(a, io, dir);
+    try std.testing.expectEqualStrings("EEE", m.kinds);
+    try std.testing.expectEqual(@as(usize, 64), m.pocket);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, m.moe);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 0, 2 }, m.used);
+    try std.testing.expectEqualSlices(u16, &.{2}, m.shards[0].layers);
+    // its experts' bytes (the MTP head's too), not the expert gate's
+    try std.testing.expectEqual(@as(u64, 3 * 256), m.shards[0].expert_bytes);
 }

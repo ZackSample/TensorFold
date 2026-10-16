@@ -1,4 +1,4 @@
-//! MLX's affine layout on the host at any group and code width; at 4 bits in groups of 64 it is affine4_host's.
+//! MLX's affine layout on the host at any group and code width.
 const std = @import("std");
 const Quant = @import("family.zig").Quant;
 
@@ -28,7 +28,7 @@ pub fn dequantize(comptime q: Quant, words: []const u32, scales: []const u16, bi
     }
 }
 
-/// Codes, scales and biases for row-major values: a group's minimum is its bias, its range over the top code its scale.
+/// Codes, scales and biases for row-major values: each group's minimum is its bias.
 pub fn quantize(comptime q: Quant, values: []const f32, words: []u32, scales: []u16, biases: []u16) void {
     comptime std.debug.assert(32 % q.bits == 0);
     const per = 32 / q.bits;

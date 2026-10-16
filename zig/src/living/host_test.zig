@@ -1,4 +1,4 @@
-//! The learner over a stand-in host and trainer on the CPU: a whole pocket lesson read, fitted, stepped, saved.
+//! The learner over a stand-in host and trainer on the CPU: a whole pocket lesson read, fitted, its outputs stepped.
 const std = @import("std");
 const learner = @import("learner.zig");
 const families = @import("families.zig");
@@ -134,7 +134,7 @@ fn Host(comptime F: fam.Family) type {
             return 1;
         }
 
-        /// The forward's rows before a save: each gate row sharp^2 times its up row (g = sharp u, w = u / sharp).
+        /// The forward's rows before a save: each neuron's gate row sharp^2 times its up row.
         pub fn pocketSwiglu(s: Ctx, _: usize, gate: []const f32, up: []const f32, _: []const f32, _: usize) !void {
             s.uploads += 1;
             if (s.saved > 0) return; // after a save the rows are as written, each rounded its own way
@@ -211,5 +211,5 @@ test "a pocket lesson over a stand-in relu^2 host: read, fitted, stepped, judged
 }
 
 test "a pocket lesson over a stand-in gated SwiGLU host: its rows handed over as gate sharp u and up u / sharp, the gate read" {
-    try run(@import("test_families.zig").swiglu);
+    try run(families.qwen4_exp);
 }

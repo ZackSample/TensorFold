@@ -305,7 +305,7 @@ pub const Status = struct {
 pub const SubmitError = error{ Closed, Busy, InvalidSpans };
 
 /// A worked example for the learner: token ids, the answer from `start`; `decide`: its assistant header's last row.
-pub const Example = struct { ids: []const u32, start: u32, decide: u32, subject: u32 = 0, value: u32 = 0 }; // subject: the row of its last token; value: the row before its answer's value (0: none)
+pub const Example = struct { ids: []const u32, start: u32, decide: u32, subject: u32 = 0, value: u32 = 0, context: u32 = 0 }; // subject: the row of its last token; value: the row before its answer's value (0: none); context: the rows of a conversation before its own turn, which other examples share (0: none)
 
 /// One fact's lesson (Sliding Weights): answers, held-out answers, near misses, and prompts that must not move.
 pub const LearnRequest = struct {
@@ -325,6 +325,8 @@ pub const LearnRequest = struct {
     save: bool = false, // every kept lesson written beside the model's shards, each with its router
     retire: []const Neuron = &.{}, // instead zero these neurons of facts a newer fact replaces
     unretire: bool = false, // instead put back the neurons the last retire zeroed (the newer fact was not learned)
+    score: []const Example = &.{}, // instead score these replies teacher-forced: is each its prompt's greedy reply now?
+    quiet: []const Example = &.{}, // instead read these through the model: do the open lesson's pocket neurons stay at or below zero on all their rows? (verdicts as `scored`)
 };
 
 /// A neuron a pocket lesson placed (Sliding Weights): its layer, its index in that layer's pocket, the row it keys on.
@@ -341,6 +343,7 @@ pub const LearnProgress = struct { phase: LearnPhase, at: u32 = 0, of: u32 = 0, 
 pub const LearnEvent = union(enum) {
     learned: struct { recalled: bool, steps: u32, loss: f32, neurons: []const Neuron = &.{} }, // neurons: a pocket's
     progress: LearnProgress,
+    scored: struct { same: []const bool }, // a score request's verdicts, one a reply: every answer row's greedy pick is its next token
     done: struct { message: []const u8 = "" },
 };
 

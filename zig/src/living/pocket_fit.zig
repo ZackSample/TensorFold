@@ -147,6 +147,76 @@ pub fn fit(gpa: std.mem.Allocator, xs: []const []const u16, kinds: []const Kind,
     return f;
 }
 
+/// A neuron's fit as the trainer runs its Adam steps on the device.
+pub const DeviceFit = struct { rows: []const u16, slots: usize, slot: usize, d: usize, kinds: []const Kind, u: []f32, inv: f32, below: f32, steps: usize };
+
+/// fit's start for a cold fit with no fixed rows, as fit runs it.
+pub fn prepare(gpa: std.mem.Allocator, xs: []const []const u16, kinds: []const Kind, d: usize, u: []f32) !struct { scale: f32, inv: f32 } {
+    const n = kinds.len;
+    var scale: f32 = 0;
+    for (xs) |x| scale += @sqrt(squares(x));
+    scale /= @floatFromInt(@max(n, 1));
+    const inv = 1 / scale;
+    var counts: [5]f32 = @splat(0);
+    for (kinds) |k| counts[@backingInt(k)] += 1;
+    const w = try gpa.alloc(f32, 2 * d);
+    defer gpa.free(w);
+    @memset(w, 0);
+    const mean_fact = w[0..d];
+    const mean_rest = w[d..][0..d];
+    for (kinds, xs) |k, x| switch (k) {
+        .fact => axpyRow(mean_fact, inv / @max(counts[0], 1), x),
+        .steady, .other => axpyRow(mean_rest, inv / @max(counts[2] + counts[3], 1), x),
+        .held, .none => {},
+    };
+    for (u, mean_fact, mean_rest) |*o, a, b| o.* = a - b;
+    const at_fact = subspace.dot(u, mean_fact);
+    if (at_fact > 0) for (u) |*o| {
+        o.* /= at_fact;
+    };
+    return .{ .scale = scale, .inv = inv };
+}
+
+/// fit's end: how `u` (scaled) sits on each kind of row, then `u` back out of the scaled space.
+pub fn finish(xs: []const []const u16, kinds: []const Kind, u: []f32, inv: f32, scale: f32) Fit {
+    var counts: [5]f32 = @splat(0);
+    for (kinds) |k| counts[@backingInt(k)] += 1;
+    var f: Fit = .{ .fact_least = std.math.inf(f32), .steady_most = -std.math.inf(f32), .other_most = -std.math.inf(f32) };
+    for (kinds, xs) |k, x| {
+        const zi = dotRow(u, x) * inv;
+        switch (k) {
+            .fact => {
+                f.fact_least = @min(f.fact_least, zi);
+                f.fact_on += @floatFromInt(@intFromBool(zi >= 0.5));
+            },
+            .held => {
+                f.held_mean += if (zi > 0) zi * zi else 0;
+                f.held_on += @floatFromInt(@intFromBool(zi >= 0.5));
+            },
+            .steady => {
+                f.steady_most = @max(f.steady_most, zi);
+                f.fires += @intFromBool(zi > 0);
+            },
+            .other => {
+                f.other_most = @max(f.other_most, zi);
+                f.fires += @intFromBool(zi > 0);
+            },
+            .none => {},
+        }
+    }
+    f.fact_on /= @max(counts[0], 1);
+    f.held_on /= @max(counts[1], 1);
+    f.held_mean /= @max(counts[1], 1);
+    for (u) |*o| o.* /= scale;
+    return f;
+}
+
+/// Adam's two bias corrections at step s, as fit's steps form them.
+pub fn corrections(s: usize) [2]f32 {
+    const tt: f32 = @floatFromInt(s);
+    return .{ 1 - std.math.pow(f32, 0.9, tt), 1 - std.math.pow(f32, 0.999, tt) };
+}
+
 const V = @Vector(8, f32);
 
 /// Eight bf16 values widened to f32, exactly.
@@ -160,7 +230,7 @@ fn bf(b: u16) f32 {
 }
 
 /// a . b for f32 `a` and bf16 `b`: four sums of eight lanes, so no add waits on the one before it.
-fn dotRow(a: []const f32, b: []const u16) f32 {
+pub fn dotRow(a: []const f32, b: []const u16) f32 {
     var acc: [4]V = @splat(@splat(0));
     var i: usize = 0;
     while (i + 32 <= a.len) : (i += 32) {

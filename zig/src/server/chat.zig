@@ -62,6 +62,9 @@ pub const Reply = struct {
     logprobs: ?Value = null,
     /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
     prompt_logprobs: ?Value = null,
+    /// The prompt's token ids as the engine read them, and the reply's as it decoded them (an end token included).
+    prompt_ids: []const u32 = &.{},
+    tokens: []const u32 = &.{},
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -204,7 +207,9 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     const result: Failure!Reply = blk: {
         if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
-        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+        var reply = gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts) catch |e| break :blk e;
+        reply.prompt_ids = request.prompt;
+        break :blk reply;
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
     return result;
@@ -488,6 +493,7 @@ const Generation = struct {
             .effort = effort,
             .logprobs = if (g.lp) |l| try @import("logprobs.zig").value(g.srv, cx, a, g.thinking, content_tokens, l.rows.items) else null,
             .prompt_logprobs = if (m.prompt_rows) |r| try @import("logprobs.zig").promptValue(g.srv, a, r) else null,
+            .tokens = g.collected.items,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
