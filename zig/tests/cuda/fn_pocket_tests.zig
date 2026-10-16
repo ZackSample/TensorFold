@@ -221,6 +221,31 @@ fn empty(r: *Rig, rows: usize, out_f32: bool) !void {
     try check.sameBytes("fn-pocket, no neuron in use: the output as it was", try r.get(out, in.out.len), in.out);
 }
 
+/// An untaught stream's rows (scale 0) keep every output bit, as with no pocket; the others' as the pocket on all.
+fn untaught(r: *Rig, rows: usize, used: usize) !void {
+    const c: Case = .{ .d = 2560, .rows = rows, .used = used, .out_f32 = true, .rs = true };
+    const in = try inputs(r, c);
+    for (in.rs, 0..) |*v, i| v.* = if (i % 3 == 1) 0 else 1;
+    var plain = c;
+    plain.rs = false;
+    const act = try r.dev(try r.a.alloc(u8, rows * fb.max_pocket * 4));
+    const scaled = try r.dev(in.out);
+    const whole = try r.dev(in.out);
+    try r.gpu.ctx.synchronize();
+    try split(r, c, try upload(r, c, in), act, scaled);
+    try split(r, plain, try upload(r, plain, in), act, whole);
+    const got = try r.get(scaled, in.out.len);
+    const all = try r.get(whole, in.out.len);
+    const row = c.d * 4;
+    for (0..rows) |i| {
+        const want = if (i % 3 == 1) in.out else all;
+        try check.sameBytes("fn-pocket, a row scaled by 0 or 1", got[i * row ..][0..row], want[i * row ..][0..row]);
+    }
+    const what = "fn-pocket untaught rows={d} used={d}: the first (taught) row moved {d} of {d} values";
+    const moved = differing(all[0..row], in.out[0..row], 4);
+    try check.expect(moved * 2 > c.d, what, .{ rows, used, moved, c.d });
+}
+
 /// GPU microseconds a launch, medians over `reps`, the L2 cache flushed before each: tf_fn_pocket_rows, then the two.
 fn timing(r: *Rig, c: Case, reps: usize) !void {
     const in = try inputs(r, c);
@@ -305,6 +330,11 @@ pub fn run(gpu: Gpu, reps: usize) !void {
         r.reset(&arena);
     };
     check.pass("fn-pocket: no neuron in use launches nothing and keeps every output bit, -0.0 included", .{});
+    for ([_]usize{ 2, 5, 70, 300 }) |rows| for ([_]usize{ 13, 64 }) |used| {
+        try untaught(&r, rows, used);
+        r.reset(&arena);
+    };
+    check.pass("fn-pocket: untaught rows keep every output bit; the taught ones' bytes as the pocket on all", .{});
     if (reps == 0) return;
     for ([_]usize{ 1, 2, 4, 8, 16, 32, 63, 64, 128, 255, 256, 512, 1536 }) |rows| for ([_]usize{ 4, 13, 64 }) |used| {
         try timing(&r, .{ .d = 2560, .rows = rows, .used = used, .out_f32 = true }, reps);

@@ -137,6 +137,8 @@ pub const Engine = struct {
     chunk: usize,
     /// Each layer's Living Weights pocket, from a taught folder's shards or the learner: every pass adds it.
     pockets: pocket.Pockets = .{},
+    /// During a round of taught and untaught streams: its rows' pocket scales (0 on an untaught row); 0: none.
+    taught_rows: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -238,7 +240,8 @@ pub const Engine = struct {
     /// Every pass's adds to the MoE outputs: each taught layer's pocket behind its shared gate.
     fn servePocket(ctx: *anyopaque, layer: usize, x: u64, ids: u64, wts: u64, out: u64, rows: usize) anyerror!void {
         const e: *Engine = @ptrCast(@alignCast(ctx));
-        const pk = e.pocketOf(layer) orelse return;
+        var pk = e.pocketOf(layer) orelse return;
+        pk.scale = e.taught_rows;
         try e.pocketOps().?.pocketRows(pk, .{ .x = x, .ids = ids, .wts = wts }, out, true, rows, dims, slots - 1);
     }
 
@@ -246,6 +249,13 @@ pub const Engine = struct {
     pub fn model(e: *Engine) batch.Model {
         const m = e.pockets.mask();
         return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
+    }
+
+    /// The weights a pass of streams that read the model as shipped reads (untaught): the pockets left out.
+    fn shipped(e: *Engine) batch.Model {
+        var m = e.model();
+        m.pocket = null;
+        return m;
     }
 
     /// A fresh cache. `cap` is how many tokens it can hold, prompt plus generated.
@@ -326,7 +336,7 @@ pub const Engine = struct {
             .tri = tri,
             .k = &e.batch_k,
             .s = s,
-            .m = e.model(),
+            .m = if (seq.untaught) e.shipped() else e.model(),
             .seq = seq.view(scores),
             .hooks = hooks,
         };
@@ -357,6 +367,15 @@ pub const Engine = struct {
         // each row's attention runs alone on the block scores
         const scores = try e.reserveScores(cap, 1);
         for (rows, seqs) |*l, q| l.* = .{ .seq = q.view(scores), .pos = q.fed };
+        // an untaught stream's row reads no pocket: a round of them alone leaves it out, a mixed one scales it by 0
+        const untaught = try e.gpa.alloc(bool, seqs.len);
+        defer e.gpa.free(untaught);
+        const scales = try e.gpa.alloc(f32, seqs.len);
+        defer e.gpa.free(scales);
+        for (untaught, seqs) |*u, q| u.* = q.untaught;
+        const reads = pocket.reads(untaught, scales);
+        defer e.taught_rows = 0;
+        if (reads == .some and e.pockets.mask() != 0) e.taught_rows = try e.pockets.rowScales(e.driver, e.stream, scales);
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
             .io = e.io,
@@ -364,7 +383,7 @@ pub const Engine = struct {
             .tri = tri,
             .k = &e.batch_k,
             .s = s,
-            .m = e.model(),
+            .m = if (reads == .none) e.shipped() else e.model(),
             .seq = rows[0].seq,
             .lanes = rows,
             .hooks = .{ .logits = .all, .logits_out = out },
@@ -392,6 +411,8 @@ pub const Seq = struct {
     fed: usize,
     logits: []u8,
     cap: usize,
+    /// The model as shipped: no learned neuron acts on its rows (a lesson writer's and its judge's reads).
+    untaught: bool = false,
 
     /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
     pub fn view(s: *Seq, scores: u64) batch.SeqState {

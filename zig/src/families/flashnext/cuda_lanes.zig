@@ -217,6 +217,7 @@ pub fn Namespace(comptime Tri: type) type {
                     return err;
                 } };
                 const l = gop.value_ptr;
+                l.seq.untaught = s.untaught;
                 errdefer {
                     dropLane(self, l);
                     self.lanes.removeByPtr(gop.key_ptr);
